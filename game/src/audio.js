@@ -1,12 +1,14 @@
 // The sound of the city, made rather than loaded: a WebAudio graph with an engine that follows the
-// throttle, a pistol crack, a two-tone siren, tyres, impacts and the chime of a job paid. No audio
-// file is fetched, so the game keeps its promise of no network request.
+// throttle, a pistol crack, a two-tone siren and the short wail that announces a new wanted star,
+// tyres, impacts, a hiss of rain and the chime of a job paid. No audio file is fetched, so the game
+// keeps its promise of no network request.
 
 export function createAudio() {
   let context = null;
   let master = null;
   let engine = null;
   let siren = null;
+  let rain = null;
   let enabled = false;
   let noiseBuffer = null;
 
@@ -151,6 +153,41 @@ export function createAudio() {
     siren = null;
   }
 
+  /** A new star: the siren sweeps up twice, the way a cruiser lights up right behind you. */
+  function sirenRise() {
+    tone(520, 0.26, 0.1, 'triangle', 1040);
+    setTimeout(() => tone(1040, 0.3, 0.08, 'triangle', 560), 260);
+  }
+
+  /** `?rain=1`: a soft hiss on a filtered loop, started only once audio has been unlocked. */
+  function startRain() {
+    const ctx = ready();
+    if (!ctx || !enabled || rain) return;
+    const source = ctx.createBufferSource();
+    source.buffer = noiseBuffer;
+    source.loop = true;
+    const filter = ctx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 2600;
+    filter.Q.value = 0.7;
+    const gain = ctx.createGain();
+    gain.gain.value = 0.0001;
+    gain.gain.setTargetAtTime(0.05, ctx.currentTime, 0.8);
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(master);
+    source.start();
+    rain = { source, gain };
+  }
+
+  function stopRain() {
+    if (!rain) return;
+    const source = rain.source;
+    rain.gain.gain.setTargetAtTime(0.0001, context.currentTime, 0.5);
+    setTimeout(() => { try { source.stop(); } catch { /* already stopped */ } }, 900);
+    rain = null;
+  }
+
   return {
     unlock,
     get on() { return enabled; },
@@ -166,6 +203,9 @@ export function createAudio() {
     },
     hurt() { tone(110, 0.24, 0.24, 'sawtooth', 55); },
     sirenBlip() { tone(720, 0.3, 0.07, 'triangle', 980); },
+    sirenRise,
+    rainStart: startRain,
+    rainStop: stopRain,
     explosion() {
       noise(0.8, 1.0, 420);
       tone(70, 0.5, 0.4, 'sawtooth', 30);

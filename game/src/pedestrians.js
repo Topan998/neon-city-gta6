@@ -1,11 +1,21 @@
 // The crowd: a hundred and thirty people walking the pavements of the grid, each on the loop of
-// one block. They are two InstancedMeshes — one tinted body each, one shared head — so the whole
-// crowd is two draw calls, and they duck and scatter when a gun goes off nearby.
+// one block. They are rigged the way the player is — a torso, two legs and two arms as separate
+// instanced meshes — so every person in the street swings their limbs from a phase advanced by the
+// ground they cover. That is six draw calls for the whole crowd instead of two, and it buys the one
+// thing a still or a moving frame needs to read as people: legs that step.
+//
+// Each person keeps their own pace, and now and then stops for a beat at a corner before walking on.
+// Panic runs the same cycle faster, so a gunshot turns strollers into a sprint. Every choice here is
+// seeded (createRandom + hashUnit), so the crowd is the same crowd on every load.
 
 import { BLOCK_HALF, PEDS, CITY, PALETTE } from './config.js';
 import { blockCenter, blockAt } from './world.js';
 import { mergeParts, box, ball, makeModelMaterial } from './shape.js';
-import { createRandom, range, int, pick } from './random.js';
+import { createRandom, range, int, pick, hashUnit } from './random.js';
+
+const TAU = Math.PI * 2;
+const TROUSERS = [0x2f3b52, 0x252a36, 0x3d3550, 0x1f2a2f, 0x4a3a30, 0x2b3442, 0x6a6470];
+const SKINS = [0xdda67c, 0xc98d63, 0xa9714f, 0xe8bd96, 0x8d5a3c, 0xf0c9a4];
 
 /** A person as merged geometry: legs, torso, arms and a head, standing 1.78 m tall. */
 export function buildPersonGeometry(options = {}) {
@@ -32,31 +42,68 @@ export function buildHeadGeometry() {
   ]);
 }
 
+/** The torso alone: the one instanced part that is tinted by the shirt colour. */
+function buildTorsoGeometry() {
+  return mergeParts([
+    box(0.5, 0.66, 0.28, 0, 1.09, 0, 0xffffff),
+    box(0.46, 0.16, 0.26, 0, 0.76, 0, 0xd9d9d9),
+  ]);
+}
+
+/** One leg, merged about the hip so the mesh can be rotated at the joint. */
+function buildLegGeometry() {
+  return mergeParts([
+    box(0.17, 0.76, 0.2, 0, -0.38, 0, 0xffffff),
+    box(0.18, 0.12, 0.3, 0, -0.76, 0.04, 0x22242c),
+  ]);
+}
+
+/** One arm, merged about the shoulder. */
+function buildArmGeometry() {
+  return mergeParts([box(0.13, 0.56, 0.15, 0, -0.28, 0, 0xffffff)]);
+}
+
 export function createPedestrians(ctx) {
   const { scene } = ctx;
   const random = createRandom(4412);
   const bodyMaterial = makeModelMaterial();
   const headMaterial = makeModelMaterial();
-  const bodies = new THREE.InstancedMesh(buildPersonGeometry(), bodyMaterial, PEDS.count);
-  const heads = new THREE.InstancedMesh(buildHeadGeometry(), headMaterial, PEDS.count);
-  bodies.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
-  heads.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  const limbMaterial = makeModelMaterial();
+  const count = PEDS.count;
+
+  const bodies = new THREE.InstancedMesh(buildTorsoGeometry(), bodyMaterial, count);
+  const heads = new THREE.InstancedMesh(buildHeadGeometry(), headMaterial, count);
+  const legGeometry = buildLegGeometry();
+  const armGeometry = buildArmGeometry();
+  const legLeft = new THREE.InstancedMesh(legGeometry, limbMaterial, count);
+  const legRight = new THREE.InstancedMesh(legGeometry, limbMaterial, count);
+  const armLeft = new THREE.InstancedMesh(armGeometry, limbMaterial, count);
+  const armRight = new THREE.InstancedMesh(armGeometry, limbMaterial, count);
+  const rig = [bodies, heads, legLeft, legRight, armLeft, armRight];
+  for (const mesh of rig) {
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    scene.add(mesh);
+  }
   bodies.castShadow = true;
+  legLeft.castShadow = true;
+  legRight.castShadow = true;
+  armLeft.castShadow = true;
+  armRight.castShadow = true;
   heads.castShadow = false;
-  scene.add(bodies);
-  scene.add(heads);
 
   const side = (BLOCK_HALF - 2) * 2;
   const perimeter = side * 4;
   const peds = [];
   const dummy = new THREE.Object3D();
+  dummy.rotation.order = 'YXZ';
   const tint = new THREE.Color();
 
-  for (let n = 0; n < PEDS.count; n += 1) {
+  for (let n = 0; n < count; n += 1) {
     const bx = int(random, 0, CITY.grid - 1);
     const bz = int(random, 0, CITY.grid - 1);
     const centre = blockCenter(bx, bz);
     const ped = {
+      index: n,
       x: centre.x,
       z: centre.z,
       heading: 0,
@@ -64,8 +111,13 @@ export function createPedestrians(ctx) {
       t: random() * perimeter,
       dir: random() < 0.5 ? 1 : -1,
       speed: PEDS.speed + range(random, -PEDS.speedJitter, PEDS.speedJitter),
-      phase: random() * Math.PI * 2,
+      phase: random() * TAU,
+      blend: 1,
+      pause: 0,
+      corners: 0,
       colour: pick(random, PALETTE.ped),
+      trousers: pick(random, TROUSERS),
+      skin: pick(random, SKINS),
       alive: true,
       panic: 0,
       fall: 0,
@@ -73,8 +125,14 @@ export function createPedestrians(ctx) {
     place(ped);
     peds.push(ped);
     bodies.setColorAt(n, tint.setHex(ped.colour));
+    legLeft.setColorAt(n, tint.setHex(ped.trousers));
+    legRight.setColorAt(n, tint.setHex(ped.trousers));
+    armLeft.setColorAt(n, tint.setHex(ped.skin));
+    armRight.setColorAt(n, tint.setHex(ped.skin));
   }
-  if (bodies.instanceColor) bodies.instanceColor.needsUpdate = true;
+  for (const mesh of rig) {
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  }
 
   /** Put a pedestrian on the pavement loop of its block. */
   function place(ped) {
@@ -91,35 +149,70 @@ export function createPedestrians(ctx) {
     if (ped.dir < 0) ped.heading += Math.PI;
   }
 
+  /** One limb: placed at its joint, turned with the body, swung about the joint. */
+  function limb(mesh, index, ped, offsetX, pivotY, groundY, bob, angle) {
+    const rx = Math.cos(ped.heading) * offsetX;
+    const rz = -Math.sin(ped.heading) * offsetX;
+    dummy.position.set(ped.x + rx, groundY + pivotY + bob, ped.z + rz);
+    dummy.rotation.set(angle, ped.heading, 0);
+    dummy.scale.setScalar(1);
+    dummy.updateMatrix();
+    mesh.setMatrixAt(index, dummy.matrix);
+  }
+
   function update(dt, player) {
     for (let index = 0; index < peds.length; index += 1) {
       const ped = peds[index];
       if (!ped.alive) {
         dummy.position.set(ped.x, -5, ped.z);
         dummy.scale.setScalar(0.001);
+        dummy.rotation.set(0, 0, 0);
         dummy.updateMatrix();
-        bodies.setMatrixAt(index, dummy.matrix);
-        heads.setMatrixAt(index, dummy.matrix);
+        for (const mesh of rig) mesh.setMatrixAt(index, dummy.matrix);
         continue;
       }
-      if (ped.panic > 0) {
-        ped.panic -= dt;
-        ped.t += ped.dir * ped.speed * 2.6 * dt;
+
+      // Walk, or wait at the corner that was just reached.
+      const cornerBefore = Math.floor((((ped.t % perimeter) + perimeter) % perimeter) / side);
+      let moved = 0;
+      if (ped.pause > 0) {
+        ped.pause -= dt;
       } else {
-        ped.t += ped.dir * ped.speed * dt;
+        const stride = ped.panic > 0 ? ped.speed * 2.6 : ped.speed;
+        const step = ped.dir * stride * dt;
+        ped.t += step;
+        moved = Math.abs(step);
+        const cornerAfter = Math.floor((((ped.t % perimeter) + perimeter) % perimeter) / side);
+        if (cornerAfter !== cornerBefore && hashUnit(ped.index, ped.corners) < PEDS.pauseChance) {
+          ped.pause = PEDS.pauseMin + hashUnit(ped.index + 91, ped.corners) * (PEDS.pauseMax - PEDS.pauseMin);
+        }
+        if (cornerAfter !== cornerBefore) ped.corners += 1;
       }
+      if (ped.panic > 0) ped.panic -= dt;
+
       place(ped);
-      ped.phase += dt * (ped.panic > 0 ? 12 : 5.2);
-      const bob = Math.abs(Math.sin(ped.phase)) * 0.055;
-      dummy.position.set(ped.x, ctx.world.groundHeight(ped.x, ped.z) + bob, ped.z);
+
+      // The gait, driven by the metres covered this frame.
+      const activity = moved > 0.0001 ? 1 : 0;
+      ped.blend += (activity - ped.blend) * Math.min(1, 9 * dt);
+      ped.phase += (moved / PEDS.stride) * TAU * (ped.panic > 0 ? 1.5 : 1);
+      const swing = Math.sin(ped.phase) * ped.blend * PEDS.swing;
+      const groundY = ctx.world.groundHeight(ped.x, ped.z);
+      const bob = Math.abs(Math.sin(ped.phase)) * 0.035 * ped.blend;
+
+      dummy.position.set(ped.x, groundY + bob, ped.z);
       dummy.rotation.set(0, ped.heading, 0);
       dummy.scale.setScalar(1);
       dummy.updateMatrix();
       bodies.setMatrixAt(index, dummy.matrix);
       heads.setMatrixAt(index, dummy.matrix);
+
+      limb(legLeft, index, ped, -0.12, 0.78, groundY, bob, swing);
+      limb(legRight, index, ped, 0.12, 0.78, groundY, bob, -swing);
+      limb(armLeft, index, ped, -0.32, 1.3, groundY, bob, -swing * 0.85);
+      limb(armRight, index, ped, 0.32, 1.3, groundY, bob, swing * 0.85);
     }
-    bodies.instanceMatrix.needsUpdate = true;
-    heads.instanceMatrix.needsUpdate = true;
+    for (const mesh of rig) mesh.instanceMatrix.needsUpdate = true;
   }
 
   /** Everyone near a noise runs. */
@@ -128,7 +221,7 @@ export function createPedestrians(ctx) {
       if (!ped.alive) continue;
       if (Math.hypot(ped.x - x, ped.z - z) < radius) {
         ped.panic = 4;
-        ped.dir = Math.random() < 0.5 ? 1 : -1;
+        ped.dir = hashUnit(ped.index, 7) < 0.5 ? 1 : -1;
       }
     }
   }
@@ -155,16 +248,18 @@ export function createPedestrians(ctx) {
   }
 
   /** Move a slice of the crowd onto one block's pavement loop: the screenshot scenes use it. */
-  function focusCrowd(x, z, count) {
+  function focusCrowd(x, z, count2) {
     const { i, j } = blockAt(x, z);
     const centre = blockCenter(i, j);
-    for (let index = 0; index < Math.min(count, peds.length); index += 1) {
+    for (let index = 0; index < Math.min(count2, peds.length); index += 1) {
       const ped = peds[index];
       ped.block = { x: centre.x, z: centre.z };
-      ped.t = (index / Math.max(1, count)) * perimeter;
+      ped.t = (index / Math.max(1, count2)) * perimeter;
       ped.dir = index % 2 === 0 ? 1 : -1;
       ped.alive = true;
       ped.panic = 0;
+      ped.pause = 0;
+      ped.blend = 1;
       place(ped);
     }
   }

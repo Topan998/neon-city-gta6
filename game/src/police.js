@@ -1,10 +1,17 @@
-// The police: a wanted level measured in stars and heat, cruisers that spawn off the edge of the
-// screen and chase you through the grid, officers who pour out and shoot when you are on foot, and
-// the siren that tells you how close they are. Heat falls once nobody has eyes on you.
+// The police: a wanted level measured in stars and heat, cruisers that hunt you through the grid,
+// officers who pour out and shoot when you are on foot, and the siren that tells you how close they
+// are. Heat falls once nobody has eyes on you.
+//
+// A cruiser has to read at a glance, from behind and at speed: the roof bar is two emissive blocks
+// that alternate red and blue on a timer, a soft glow sprite under them floods the roof and the
+// tarmac with the same colour, and the first cruiser of a fresh chase is put down the road behind
+// you rather than at the edge of the map, so the chase starts in frame.
 
 import { WANTED, CRIME, CITY } from './config.js';
 import { buildPersonGeometry } from './pedestrians.js';
 import { mergeParts, box, makeModelMaterial } from './shape.js';
+import { createRandom } from './random.js';
+import { glowTexture } from './effects.js';
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -17,17 +24,22 @@ function angleDelta(from, to) {
 
 export function createPolice(ctx) {
   const { scene, world, audio, effects, vehicles, player, hud, state } = ctx;
+  const random = createRandom(6203);
   const officerMaterial = makeModelMaterial();
   const officerGeometry = buildPersonGeometry({ shirt: 0x1e2a45, trousers: 0x141b29, skin: 0xc98d63, hair: 0x17120f });
   const units = [];
   const officers = [];
   const flashMaterialRed = new THREE.MeshBasicMaterial({ color: 0xff2b45, toneMapped: false });
   const flashMaterialBlue = new THREE.MeshBasicMaterial({ color: 0x2b6bff, toneMapped: false });
+  const barGeometry = new THREE.BoxGeometry(0.5, 0.16, 0.34);
+  const glowMap = glowTexture();
 
   let spawnTimer = 0;
   let sirenTimer = 0;
   let lastSeen = 0;
   let starsShown = 0;
+  // A fresh chase puts its first cruiser close; later reinforcements come from off-screen.
+  let closeNext = false;
 
   function starFor(heat) {
     let count = 0;
@@ -39,20 +51,32 @@ export function createPolice(ctx) {
 
   /** A crime raises the heat; `report` is what every violent act in the game calls. */
   function report(amount) {
+    const before = state.wanted;
     state.heat = clamp(state.heat + amount, 0, 200);
     state.wanted = starFor(state.heat);
     lastSeen = state.time;
+    if (state.wanted > before) {
+      closeNext = true;
+      audio.sirenRise();
+    }
     if (state.wanted > starsShown) {
       starsShown = state.wanted;
       hud?.toast(state.wanted >= 3 ? `Wanted level ${state.wanted} — the whole precinct is out` : 'Police are on to you', 'bad');
     }
     audio.sirenBlip();
+    hud?.pulseWanted();
   }
 
   function setWanted(count) {
+    const before = state.wanted;
     state.wanted = clamp(count, 0, 5);
     state.heat = Math.max(state.heat, WANTED.stars[state.wanted] ?? 0);
     starsShown = Math.max(starsShown, state.wanted);
+    if (state.wanted > before) {
+      closeNext = true;
+      audio.sirenRise();
+      hud?.pulseWanted();
+    }
   }
 
   function clear() {
@@ -64,6 +88,7 @@ export function createPolice(ctx) {
     state.heat = 0;
     state.wanted = 0;
     starsShown = 0;
+    closeNext = false;
     audio.sirenStop();
   }
 
@@ -84,13 +109,28 @@ export function createPolice(ctx) {
     let x = 0;
     let z = 0;
     let heading = 0;
+    let rolling = 0;
     if (at) {
       x = at.x;
       z = at.z;
       heading = at.heading ?? 0;
+    } else if (closeNext && units.length === 0) {
+      // The first car of a chase starts down the road behind the player, in their lane, already
+      // rolling: the reaction reads immediately instead of arriving from the horizon.
+      const behind = player.state.car ? player.state.car.heading : player.state.yaw;
+      x = player.state.x - Math.sin(behind) * WANTED.firstSpawn;
+      z = player.state.z - Math.cos(behind) * WANTED.firstSpawn;
+      const road = world.nearestRoad(x, z);
+      if (road.axis === 'x') x = Math.abs(player.state.x - road.line) < 6 ? player.state.x : road.line;
+      else z = Math.abs(player.state.z - road.line) < 6 ? player.state.z : road.line;
+      const limit = world.map.half - 4;
+      x = clamp(x, -limit, limit);
+      z = clamp(z, -limit, limit);
+      heading = Math.atan2(player.state.x - x, player.state.z - z);
+      rolling = 19;
     } else {
-      const angle = Math.random() * Math.PI * 2;
-      const radius = 105 + Math.random() * 45;
+      const angle = random() * Math.PI * 2;
+      const radius = 105 + random() * 45;
       x = player.state.x + Math.cos(angle) * radius;
       z = player.state.z + Math.sin(angle) * radius;
       const road = world.nearestRoad(x, z);
@@ -100,20 +140,35 @@ export function createPolice(ctx) {
       z = clamp(z, -limit, limit);
       heading = Math.atan2(player.state.x - x, player.state.z - z);
     }
+    closeNext = false;
 
     const car = vehicles.addCar({ x, z, heading, kind: 'police', driver: 'police', colour: 0xe9edf2 });
     car.mesh.rotation.y = heading;
     if (at?.speed) {
       car.vx = Math.sin(heading) * at.speed;
       car.vz = Math.cos(heading) * at.speed;
+    } else if (rolling) {
+      car.vx = Math.sin(heading) * rolling;
+      car.vz = Math.cos(heading) * rolling;
+      car.speed = rolling;
     }
 
-    const red = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.16, 0.34), flashMaterialRed);
+    const red = new THREE.Mesh(barGeometry, flashMaterialRed);
     red.position.set(0.4, 1.56, -0.2);
-    const blue = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.16, 0.34), flashMaterialBlue);
+    const blue = new THREE.Mesh(barGeometry, flashMaterialBlue);
     blue.position.set(-0.4, 1.56, -0.2);
     car.mesh.add(red);
     car.mesh.add(blue);
+
+    // The bloom under the bar: a sprite, so it always faces the camera, tinted to whichever half
+    // of the bar is lit this instant.
+    const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: glowMap, color: 0xff2b45, transparent: true, opacity: 0.8,
+      blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+    }));
+    glow.position.set(0, 1.62, -0.2);
+    glow.scale.set(4.4, 4.4, 1);
+    car.mesh.add(glow);
 
     units.push({
       car,
@@ -123,7 +178,8 @@ export function createPolice(ctx) {
       stuck: 0,
       red,
       blue,
-      flash: 0,
+      glow,
+      flash: random() * 6,
     });
   }
 
@@ -141,8 +197,8 @@ export function createPolice(ctx) {
         heading: unit.car.heading,
         health: 60,
         alive: true,
-        fireCooldown: 1.2 + Math.random(),
-        walk: Math.random() * 6,
+        fireCooldown: 1.2 + random(),
+        walk: random() * 6,
       };
       unit.officers.push(officer);
       officers.push(officer);
@@ -172,7 +228,7 @@ export function createPolice(ctx) {
       officer.mesh.rotation.y = officer.heading;
 
       if (distance < 34 && officer.fireCooldown <= 0 && state.mode === 'play') {
-        officer.fireCooldown = 0.85 + Math.random() * 0.7;
+        officer.fireCooldown = 0.85 + random() * 0.7;
         const hitChance = distance < 14 ? 0.72 : 0.4;
         effects.tracer(
           { x: officer.x, y: 1.3, z: officer.z },
@@ -180,7 +236,7 @@ export function createPolice(ctx) {
           0x9ec5ff,
         );
         audio.pistol();
-        if (Math.random() < hitChance) player.takeDamage(7, state.time);
+        if (random() < hitChance) player.takeDamage(7, state.time);
       }
     }
   }
@@ -227,10 +283,16 @@ export function createPolice(ctx) {
         if (unit.hitCooldown <= 0) unit.hitRecently = false;
       }
 
-      // Lights flash twice a second.
-      unit.flash += dt * 8;
-      unit.red.visible = Math.sin(unit.flash) > 0;
-      unit.blue.visible = Math.sin(unit.flash) <= 0;
+      // The light bar: red and blue alternate on a timer, and the glow under the bar follows the
+      // lit half and breathes with it, so a cruiser is obvious even at the edge of the frame.
+      unit.flash += dt * 13;
+      const up = Math.sin(unit.flash) > 0;
+      unit.red.visible = up;
+      unit.blue.visible = !up;
+      const pulse = 3.9 + Math.abs(Math.sin(unit.flash * 0.55)) * 1.9;
+      unit.glow.material.color.setHex(up ? 0xff2b45 : 0x2b6bff);
+      unit.glow.scale.set(pulse, pulse, 1);
+      unit.glow.material.opacity = 0.55 + Math.abs(Math.cos(unit.flash * 0.55)) * 0.4;
 
       if (!unit.deployed && !player.state.car && distance < 26 && car.speed < 4) {
         unit.deployTimer += dt;
@@ -342,6 +404,18 @@ export function createPolice(ctx) {
     return false;
   }
 
+  /** Freeze every bar on one colour: the chase screenshot is taken at that instant. */
+  function snapLights(colour = 'red') {
+    const red = colour !== 'blue';
+    for (const unit of units) {
+      unit.red.visible = red;
+      unit.blue.visible = !red;
+      unit.glow.material.color.setHex(red ? 0xff2b45 : 0x2b6bff);
+      unit.glow.scale.set(5.2, 5.2, 1);
+      unit.glow.material.opacity = 0.95;
+    }
+  }
+
   return {
     units,
     officers,
@@ -352,6 +426,7 @@ export function createPolice(ctx) {
     raycast,
     damageOfficer,
     damageCar,
+    snapLights,
     /** Place a cruiser by hand: the screenshot scenes and anything scripted use this. */
     spawnAt: (x, z, heading, speed = 0) => spawnUnit({ x, z, heading, speed }),
     get starCount() { return state.wanted; },

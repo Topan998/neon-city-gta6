@@ -4,13 +4,17 @@
 // between four screens — title, play, paused and wasted — and every job or death writes the
 // player's money and progress to localStorage.
 //
-// ?shot=city|chase|mission|night stages one photograph of the real game for the screenshots: it
+// Two addresses change the mood: `?rain=1` starts the game under a shower (T toggles it), and
+// `?shot=city|chase|mission|night` stages one photograph of the real game for the screenshots — it
 // drives the same systems for a fixed number of steps and then holds still, so a plain page load
-// shows the scene without a mouse or a pointer lock.
+// shows the scene without a mouse or a pointer lock. The title screen opens on a five-second pan
+// from street level out over downtown before it settles into its slow orbit.
 
 import { SAVE_KEY, CRIME, PLAYER, CAR, CITY, HALF } from './config.js';
 import { blockCenter, createWorld } from './world.js';
-import { createInput, ACTION_ENTER_CAR, ACTION_PAUSE, ACTION_SAVE_QUIT, ACTION_START } from './input.js';
+import {
+  createInput, ACTION_ENTER_CAR, ACTION_PAUSE, ACTION_SAVE_QUIT, ACTION_START, ACTION_TOGGLE_RAIN,
+} from './input.js';
 import { createAudio } from './audio.js';
 import { createVehicleSystem } from './vehicles.js';
 import { createPedestrians } from './pedestrians.js';
@@ -47,6 +51,7 @@ const input = createInput(canvas);
 const state = {
   mode: 'menu',
   time: 0,
+  menuTime: 0,
   money: 0,
   wanted: 0,
   heat: 0,
@@ -54,6 +59,7 @@ const state = {
   jobs: 0,
   deaths: 0,
   hasSave: false,
+  rain: params.get('rain') === '1',
   forcedNight: params.get('night') === '1' ? 1 : 0,
 };
 
@@ -65,6 +71,22 @@ ctx.police = createPolice(ctx);
 ctx.missions = createMissions(ctx);
 
 const { vehicles, pedestrians, player, police, missions } = ctx;
+
+// ---- weather ----
+/** Turn the shower on or off: sky, fog, wet asphalt, the drops and the hiss all follow. */
+function setRain(on) {
+  state.rain = Boolean(on);
+  world.setRain(state.rain);
+  effects.setRain(state.rain);
+  if (state.rain) audio.rainStart();
+  else audio.rainStop();
+  hud.toast(state.rain ? 'Rain over the bay' : 'The rain moves on', 'good');
+}
+
+if (state.rain) {
+  world.setRain(true);
+  effects.setRain(true);
+}
 
 // ---- where the player starts, and where the clinic puts them back ----
 const clinic = blockCenter(2, 2);
@@ -154,6 +176,7 @@ function startGame() {
   hud.showWasted(false);
   hud.showPause(false);
   audio.unlock();
+  if (state.rain) audio.rainStart();
   state.mode = 'play';
   if (state.hasSave) hud.toast('Save loaded — back on the street', 'good');
   else hud.toast('Vice Coast · press F at any car to take it', 'good');
@@ -244,6 +267,7 @@ function handleActions(actions) {
     else if (state.mode === 'pause') resumeGame();
   }
   if (actions & ACTION_ENTER_CAR && state.mode === 'play') toggleCar();
+  if (actions & ACTION_TOGGLE_RAIN && state.mode === 'play') setRain(!state.rain);
   if (actions & ACTION_SAVE_QUIT && state.mode === 'pause') {
     save();
     state.mode = 'menu';
@@ -277,6 +301,9 @@ function separateCars() {
   }
 }
 
+// One reusable point for the systems that just need to know where the action is.
+const focusPoint = { x: 0, z: 0 };
+
 // ---- the simulation step ----
 function tick(dt) {
   state.time += dt;
@@ -285,12 +312,16 @@ function tick(dt) {
   if (state.mode !== 'play') return;
 
   const car = player.state.car;
+  focusPoint.x = player.state.x;
+  focusPoint.z = player.state.z;
   if (car) {
     const throttle = input.forward();
     const steer = input.strafe();
     vehicles.step(car, dt, { throttle, steer, handbrake: input.sprint() });
     player.state.x = car.x;
     player.state.z = car.z;
+    focusPoint.x = car.x;
+    focusPoint.z = car.z;
     audio.setEngine(car.speed, throttle);
     if (input.takeFire()) {
       // Firing from the driver's seat is a window-shot: the pistol still works.
@@ -301,13 +332,14 @@ function tick(dt) {
   }
 
   player.update(dt, input, state.time);
-  world.update(dt, { x: player.state.x, z: player.state.z });
+  world.update(dt, focusPoint);
   vehicles.update(dt);
   pedestrians.update(dt, player);
   separateCars();
   police.update(dt);
   missions.update(dt);
   effects.update(dt);
+  effects.updateRain(dt, focusPoint);
   player.updateCamera(dt, input);
 
   if (!player.state.alive && state.mode === 'play') wastePlayer();
@@ -318,6 +350,9 @@ function tick(dt) {
   hud.setHealth(player.state.health);
   hud.setArmed(!player.state.car);
   hud.setSpeed(player.state.car ? player.state.car.speed * 3.6 : 0, Boolean(player.state.car));
+  hud.setHint(player.state.car
+    ? 'F leave car · SHIFT handbrake · T rain'
+    : 'F enter car · LMB fire · SHIFT sprint · T rain');
   hud.drawMap({
     x: player.state.x,
     z: player.state.z,
@@ -329,19 +364,33 @@ function tick(dt) {
   });
 }
 
-/** The title screen's backdrop: the camera drifts around downtown, the city going about its day. */
+/** The title screen's backdrop: a five-second pan up from the avenue into a slow orbit downtown. */
 function menuCamera(dt) {
   state.time += dt;
+  state.menuTime = Math.min(5, state.menuTime + dt);
+  const t = state.menuTime / 5;
+  const ease = t * t * (3 - 2 * t);
   const orbit = state.time * 0.06;
   const radius = 118;
   const camera = player.camera;
-  camera.position.set(Math.cos(orbit) * radius, 58, Math.sin(orbit) * radius);
-  camera.lookAt(0, 12, 0);
-  world.update(dt, { x: Math.cos(orbit) * 30, z: Math.sin(orbit) * 30 });
+  const orbitX = Math.cos(orbit) * radius;
+  const orbitZ = Math.sin(orbit) * radius;
+  camera.position.set(
+    -7 + (orbitX + 7) * ease,
+    4.2 + (58 - 4.2) * ease,
+    -150 + (orbitZ + 150) * ease,
+  );
+  camera.lookAt(0, 9 - 3 * (1 - ease), -150 + 150 * ease);
+  menuFocus.x = camera.position.x * 0.3;
+  menuFocus.z = camera.position.z * 0.3;
+  world.update(dt, menuFocus);
   vehicles.update(dt);
   pedestrians.update(dt, player);
   effects.update(dt);
+  effects.updateRain(dt, menuFocus);
 }
+
+const menuFocus = { x: 0, z: 0 };
 
 // ---- the loop ----
 let accumulator = 0;
@@ -367,9 +416,8 @@ function frame(now) {
     if (steps === 6) accumulator = 0;
   } else {
     accumulator = 0;
-    if (state.mode === 'cinema') {
-      player.updateCamera(dt, input);
-    }
+    // A staged photograph is held exactly as it was left: no camera drift, no re-settling, so two
+    // renders of the same scene are identical down to the byte.
   }
 
   renderer.render(scene, player.camera);
@@ -406,6 +454,8 @@ if (params.get('selftest') === '1') {
 
 if (shotName) {
   input.goSimulated();
+  // A still cannot show an animation in motion: freeze the CSS so two renders match to the byte.
+  document.body.classList.add('shot');
   hud.showMenu(false);
   hud.setPlaying(true);
   hud.showWasted(false);
@@ -416,12 +466,15 @@ if (shotName) {
   // Nothing moves after a staged scene: draw the shadow map once and then reuse it.
   renderer.shadowMap.autoUpdate = false;
   renderer.shadowMap.needsUpdate = true;
-  hud.setMoney(state.money);
+  hud.setMoney(state.money, true);
   hud.setJobs(state.completed.length);
   hud.setWanted(state.wanted);
   hud.setHealth(player.state.health);
   hud.setArmed(!player.state.car);
   hud.setSpeed(player.state.car ? player.state.car.speed * 3.6 : 0, Boolean(player.state.car));
+  hud.setHint(player.state.car
+    ? 'F leave car · SHIFT handbrake · T rain'
+    : 'F enter car · LMB fire · SHIFT sprint · T rain');
   hud.drawMap({
     x: player.state.x,
     z: player.state.z,

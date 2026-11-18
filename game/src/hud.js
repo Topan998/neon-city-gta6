@@ -1,6 +1,10 @@
 // The heads-up display and the screens around it: cash, jobs, wanted stars, condition, speed,
 // objective, toasts, the start / pause / wasted screens, and the minimap — a canvas that draws the
 // street grid, the blocks, the player's arrow, the police and every live marker each frame.
+//
+// Two things here are alive rather than printed: the cash counts up or down to its new value over a
+// third of a second instead of snapping, and a wanted star that has just been earned makes the whole
+// row pulse red until the siren settles.
 
 import { HALF, CITY, BLOCK_HALF } from './config.js';
 
@@ -29,15 +33,53 @@ export function createHud() {
   const body = document.body;
 
   let lastMoney = -1;
+  let moneyShown = 0;
+  let moneyTarget = 0;
+  let moneyTicking = false;
+  let moneyLast = 0;
   let lastJobs = -1;
   let lastStars = -1;
   let lastHealth = -1;
+  let riseTimer = 0;
   let toastCount = 0;
 
-  function setMoney(value) {
-    if (value === lastMoney) return;
-    lastMoney = value;
+  function paintMoney(value) {
     moneyEl.textContent = `$${Math.round(value).toLocaleString('en-US')}`;
+  }
+
+  /** The ticker: ease the displayed amount toward the real one, a frame at a time. */
+  function tickMoney(now) {
+    const dt = Math.min(0.06, Math.max(0.008, (now - moneyLast) / 1000 || 0.016));
+    moneyLast = now;
+    const gap = moneyTarget - moneyShown;
+    if (Math.abs(gap) < 1) {
+      moneyShown = moneyTarget;
+      paintMoney(moneyShown);
+      moneyTicking = false;
+      return;
+    }
+    moneyShown += gap * Math.min(1, dt * 9) + Math.sign(gap) * 3;
+    paintMoney(moneyShown);
+    requestAnimationFrame(tickMoney);
+  }
+
+  function setMoney(value, instant = false) {
+    const rounded = Math.round(value);
+    if (rounded === lastMoney && !instant) return;
+    lastMoney = rounded;
+    moneyTarget = rounded;
+    if (instant || moneyShown === 0) {
+      moneyShown = rounded;
+      paintMoney(moneyShown);
+      moneyTicking = false;
+      return;
+    }
+    paintMoney(moneyShown);
+    if (!moneyTicking) {
+      moneyTicking = true;
+      moneyLast = performance.now();
+      requestAnimationFrame(tickMoney);
+    }
   }
 
   function setJobs(value) {
@@ -48,9 +90,18 @@ export function createHud() {
 
   function setWanted(stars) {
     if (stars === lastStars) return;
+    const rose = stars > lastStars && lastStars >= 0;
     lastStars = stars;
     starEls.forEach((star, index) => star.classList.toggle('on', index < stars));
     wantedEl.classList.toggle('hot', stars >= 3);
+    if (rose) pulseWanted();
+  }
+
+  /** A new star was earned: make the row flash until the moment passes. */
+  function pulseWanted() {
+    wantedEl.classList.add('rising');
+    clearTimeout(riseTimer);
+    riseTimer = setTimeout(() => wantedEl.classList.remove('rising'), 1300);
   }
 
   function setHealth(value) {
@@ -99,6 +150,14 @@ export function createHud() {
     if (!driving) return;
     speedEl.textContent = String(Math.round(kmh));
     gearEl.textContent = 'D';
+  }
+
+  let hintText = '';
+  /** The line under the condition bar follows the seat you are in. */
+  function setHint(text) {
+    if (text === hintText) return;
+    hintText = text;
+    byId('hint').textContent = text;
   }
 
   function showMenu(visible) {
@@ -218,12 +277,14 @@ export function createHud() {
     setMoney,
     setJobs,
     setWanted,
+    pulseWanted,
     setHealth,
     setObjective,
     setTimer,
     toast,
     flashDamage,
     setSpeed,
+    setHint,
     showMenu,
     showPause,
     showWasted,

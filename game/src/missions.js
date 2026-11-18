@@ -1,11 +1,15 @@
 // Three jobs and the story that ties them: steal a show car for a fence, wipe out the crew that
 // burned your brother, then outrun the precinct to the marina. Each one has a marker on the street,
 // an objective on the HUD, a timer where it matters and a payout that saves to the browser.
+//
+// The walk-up markers pulse, the crew runs at you out of the same physics the rest of the city uses,
+// and the drop marker's beacon is tall enough to steer by from three blocks away.
 
 import { MISSIONS, CRIME } from './config.js';
 import { roadLine } from './world.js';
 import { buildPersonGeometry } from './pedestrians.js';
 import { makeModelMaterial } from './shape.js';
+import { createRandom } from './random.js';
 
 const DEFINITIONS = [
   {
@@ -42,6 +46,7 @@ const DEFINITIONS = [
 
 export function createMissions(ctx) {
   const { scene, world, vehicles, player, police, hud, audio, effects, state } = ctx;
+  const random = createRandom(7741);
   const crewMaterial = makeModelMaterial();
   const crewGeometry = buildPersonGeometry({ shirt: 0x8d2436, trousers: 0x1f222c, skin: 0xc98d63, hair: 0x120f0d });
 
@@ -66,7 +71,7 @@ export function createMissions(ctx) {
     const beam = new THREE.Mesh(
       new THREE.CylinderGeometry(3.1, 3.1, 42, 20, 1, true),
       new THREE.MeshBasicMaterial({
-        color: colour, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
+        color: colour, transparent: true, opacity: 0.16, side: THREE.DoubleSide,
         depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending,
       }),
     );
@@ -75,7 +80,7 @@ export function createMissions(ctx) {
     const core = new THREE.Mesh(
       new THREE.CylinderGeometry(1.1, 1.1, 42, 12, 1, true),
       new THREE.MeshBasicMaterial({
-        color: colour, transparent: true, opacity: 0.5, side: THREE.DoubleSide,
+        color: colour, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
         depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending,
       }),
     );
@@ -137,8 +142,8 @@ export function createMissions(ctx) {
         heading: angle,
         health: 60,
         alive: true,
-        fireCooldown: 0.8 + Math.random() * 0.8,
-        walk: Math.random() * 6,
+        fireCooldown: 0.8 + random() * 0.8,
+        walk: random() * 6,
       });
     }
     crewLeft = crew.length;
@@ -236,10 +241,10 @@ export function createMissions(ctx) {
       member.mesh.rotation.y = member.heading;
 
       if (distance < 34 && member.fireCooldown <= 0 && state.mode === 'play' && player.state.alive) {
-        member.fireCooldown = 1 + Math.random() * 0.8;
+        member.fireCooldown = 1 + random() * 0.8;
         effects.tracer({ x: member.x, y: 1.3, z: member.z }, { x: player.state.x, y: 1.2, z: player.state.z }, 0xff9a9a);
         audio.pistol();
-        if (Math.random() < (distance < 14 ? 0.62 : 0.32)) player.takeDamage(9, state.time);
+        if (random() < (distance < 14 ? 0.62 : 0.32)) player.takeDamage(9, state.time);
       }
     }
   }

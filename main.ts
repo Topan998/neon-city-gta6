@@ -2,6 +2,10 @@
 // dossier the judge reads with the kit's own library, so the file the gate rebuilds matches this one
 // byte for byte. This is what `/output` gets, nothing else.
 //
+// The screenshots are checked before the dossier is written: no more than four, each 1280×720 and
+// under the gate's 256 KiB cap. A file that would be refused by the scorer fails here instead of
+// shipping quietly.
+//
 // Node 22 runs this file directly, no build and no install:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 //
@@ -15,6 +19,8 @@ import { buildDossier } from './vendor/makefun-game.ts';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const out = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+const SHOT_CAP = 262144;
+const SHOT_MAX = 4;
 
 /** Every file under a directory, for the one-line summary printed when the copy is done. */
 function walk(dir) {
@@ -37,6 +43,21 @@ for (const stale of ['game', 'screenshots']) {
 cpSync(join(root, 'game'), join(out, 'game'), { recursive: true });
 if (existsSync(join(root, 'screenshots'))) {
   cpSync(join(root, 'screenshots'), join(out, 'screenshots'), { recursive: true });
+}
+
+// The four photographs are part of the entry: refuse to hand in a set the scorer would drop.
+const shotDir = join(out, 'screenshots');
+if (existsSync(shotDir)) {
+  const shots = readdirSync(shotDir);
+  if (shots.length > SHOT_MAX) {
+    throw new Error(`${shots.length} screenshots in ${shotDir}: the gate takes ${SHOT_MAX}`);
+  }
+  for (const name of shots) {
+    const bytes = statSync(join(shotDir, name)).size;
+    if (bytes > SHOT_CAP) {
+      throw new Error(`${name} is ${bytes} B: the gate caps a screenshot at ${SHOT_CAP} B`);
+    }
+  }
 }
 
 const dossier = buildDossier(out, {

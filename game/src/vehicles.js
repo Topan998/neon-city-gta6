@@ -2,10 +2,14 @@
 // the traffic that keeps the streets busy. Parked cars are there to be stolen; traffic cars drive
 // the grid on their own, turning at intersections; the police and the player drive with the same
 // physics, so a chase feels the same from either seat.
+//
+// The car you are driving carries a cone of light on the road and, after dark, two small blooms on
+// its headlights, so the night street reads as a place with cars on it rather than a lit model.
 
 import { CAR, TRAFFIC, PALETTE } from './config.js';
 import { mergeParts, box, cylinder, makeModelMaterial } from './shape.js';
 import { createRandom, range, pick, int } from './random.js';
+import { glowTexture } from './effects.js';
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
@@ -86,20 +90,64 @@ export function makeCar(scene, material, geometry, options) {
   mesh.rotation.y = options.heading;
   scene.add(mesh);
   let beam = null;
+  let headlights = null;
+  let wash = null;
+  let tail = null;
   if (options.driver === 'player') {
     beam = new THREE.Mesh(
-      new THREE.PlaneGeometry(10, 18),
+      new THREE.PlaneGeometry(8, 16),
       new THREE.MeshBasicMaterial({
         map: headlightTexture(), transparent: true, opacity: 0, depthWrite: false,
         blending: THREE.AdditiveBlending, toneMapped: false,
       }),
     );
     beam.rotation.x = -Math.PI / 2;
-    beam.position.set(0, 0.07, 10);
+    beam.position.set(0, 0.07, 9);
     mesh.add(beam);
+
+    // A soft wash of light on the tarmac ahead, so the road in front of the car is never black.
+    wash = new THREE.Mesh(
+      new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({
+        map: glowTexture(), color: 0xffe0a8, transparent: true, opacity: 0, depthWrite: false,
+        blending: THREE.AdditiveBlending, toneMapped: false,
+      }),
+    );
+    wash.rotation.x = -Math.PI / 2;
+    wash.scale.set(7, 12, 1);
+    wash.position.set(0, 0.075, 8.5);
+    mesh.add(wash);
+
+    // Two blooms over the headlights, lit only once the sky is dark.
+    headlights = [];
+    for (const sx of [-0.58, 0.58]) {
+      const bloom = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glowTexture(), color: 0xfff2cd, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+      }));
+      bloom.position.set(sx, 0.8, 2.24);
+      bloom.scale.set(1.9, 1.9, 1);
+      mesh.add(bloom);
+      headlights.push(bloom);
+    }
+
+    tail = [];
+    for (const sx of [-0.6, 0.6]) {
+      const glow = new THREE.Sprite(new THREE.SpriteMaterial({
+        map: glowTexture(), color: 0xff3a2e, transparent: true, opacity: 0,
+        blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
+      }));
+      glow.position.set(sx, 0.8, -2.2);
+      glow.scale.set(1.7, 1.7, 1);
+      mesh.add(glow);
+      tail.push(glow);
+    }
   }
   return {
     beam,
+    headlights,
+    wash,
+    tail,
     mesh,
     x: options.x,
     z: options.z,
@@ -327,7 +375,18 @@ export function createVehicleSystem(ctx) {
     updateTraffic(dt);
     const night = world.timeOfDay;
     for (const car of cars) {
-      if (car.beam) car.beam.material.opacity = night * 0.6;
+      if (car.beam) car.beam.material.opacity = night * 0.3;
+      if (car.wash) car.wash.material.opacity = night * 0.32;
+      if (car.headlights) {
+        const glowOpacity = night * 0.85;
+        car.headlights[0].material.opacity = glowOpacity;
+        car.headlights[1].material.opacity = glowOpacity;
+      }
+      if (car.tail) {
+        const tailOpacity = night * 0.7;
+        car.tail[0].material.opacity = tailOpacity;
+        car.tail[1].material.opacity = tailOpacity;
+      }
     }
   }
 

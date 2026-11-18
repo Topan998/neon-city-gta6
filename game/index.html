@@ -44,7 +44,9 @@
   }
   #wanted i.on { color: var(--gold); text-shadow: 0 0 12px rgba(255, 209, 102, .8); }
   #wanted.hot i.on { color: var(--coral); text-shadow: 0 0 14px rgba(255, 95, 126, .9); animation: pulse .9s infinite; }
+  #wanted.rising i.on { animation: star-rise .32s ease-in-out infinite alternate; }
   @keyframes pulse { 50% { opacity: .45; } }
+  @keyframes star-rise { from { transform: scale(1); } to { transform: scale(1.5); } }
 
   #objective {
     position: absolute; left: 50%; top: 22px; transform: translateX(-50%);
@@ -120,6 +122,10 @@
   #pause p, #wasted p { color: rgba(234, 242, 255, .7); letter-spacing: .12em; font-size: 13px; margin-top: 12px; }
 
   #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+
+  /* A staged screenshot is a still: freeze every animated HUD element so two renders of the same
+     scene are identical to the byte. */
+  body.shot #hud, body.shot #hud * { animation: none !important; transition: none !important; }
 </style>
 </head>
 <body>
@@ -139,7 +145,7 @@
   <div class="card" id="bottom-left">
     <span class="label">condition</span>
     <div id="health"><i id="health-fill"></i></div>
-    <div id="hint">F enter car · LMB fire · SHIFT sprint</div>
+    <div id="hint">F enter car · LMB fire · SHIFT sprint · T rain</div>
   </div>
   <div class="card" id="speedo"><span id="speed">0</span><span class="unit">km/h</span> <span id="gear">D</span></div>
   <div class="card" id="map-wrap">
@@ -162,6 +168,7 @@
     <b>F</b><span>enter or leave a car</span>
     <b>LEFT CLICK</b><span>fire your pistol</span>
     <b>SHIFT</b><span>sprint · handbrake in a car</span>
+    <b>T</b><span>rain on, rain off</span>
     <b>ESC / P</b><span>pause and save</span>
   </div>
   <div id="start-prompt">PRESS ENTER TO START</div>

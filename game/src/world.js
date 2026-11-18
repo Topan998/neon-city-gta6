@@ -2,12 +2,17 @@
 // palms, street lamps and neon, under a gradient sky that turns from noon to midnight. Everything
 // static is an InstancedMesh, so the whole city costs a handful of draw calls.
 //
+// Weather is part of the world, not an afterthought: `setTimeOfDay` paints the hour, `setWet` turns
+// the asphalt into something that holds a lamp's light, and `setRain` darkens the sky and pulls the
+// fog in for `?rain=1`.
+//
 // The block grid is the contract the rest of the game uses: `blockCenter` and `roadLine` place
 // traffic, pedestrians, police and mission markers on the same streets the buildings stand beside.
 
-import { CITY, HALF, ROAD_HALF, BLOCK_HALF, LOT_HALF, BOUNDS, PALETTE } from './config.js';
+import { CITY, HALF, ROAD_HALF, BLOCK_HALF, LOT_HALF, BOUNDS, PALETTE, WEATHER } from './config.js';
 import { createRandom, range, int, pick } from './random.js';
-import { mergeParts } from './shape.js';
+import { mergeParts, disc } from './shape.js';
+import { glowTexture } from './effects.js';
 
 /** The centre of block (i, j): blocks sit between the streets, not on them. */
 export function blockCenter(i, j) {
@@ -27,6 +32,7 @@ export function blockAt(x, z) {
 }
 
 function makeAsphaltTexture() {
+  const random = createRandom(8811);
   const size = 128;
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -35,9 +41,9 @@ function makeAsphaltTexture() {
   g.fillStyle = '#4e5259';
   g.fillRect(0, 0, size, size);
   for (let i = 0; i < 5200; i += 1) {
-    const v = 46 + Math.floor(Math.random() * 54);
-    g.fillStyle = `rgba(${v},${v + 1},${v + 7},${0.2 + Math.random() * 0.5})`;
-    g.fillRect(Math.random() * size, Math.random() * size, 1 + Math.random() * 2, 1 + Math.random() * 2);
+    const v = 46 + Math.floor(random() * 54);
+    g.fillStyle = `rgba(${v},${v + 1},${v + 7},${0.2 + random() * 0.5})`;
+    g.fillRect(random() * size, random() * size, 1 + random() * 2, 1 + random() * 2);
   }
   const texture = new THREE.CanvasTexture(canvas);
   texture.wrapS = THREE.RepeatWrapping;
@@ -49,6 +55,7 @@ function makeAsphaltTexture() {
 }
 
 function makePavingTexture() {
+  const random = createRandom(3317);
   const size = 128;
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -57,9 +64,9 @@ function makePavingTexture() {
   g.fillStyle = '#928a7b';
   g.fillRect(0, 0, size, size);
   for (let i = 0; i < 1400; i += 1) {
-    const v = 120 + Math.floor(Math.random() * 50);
+    const v = 120 + Math.floor(random() * 50);
     g.fillStyle = `rgba(${v},${v - 6},${v - 16},${0.22})`;
-    g.fillRect(Math.random() * size, Math.random() * size, 2, 2);
+    g.fillRect(random() * size, random() * size, 2, 2);
   }
   g.strokeStyle = 'rgba(96, 88, 78, 0.5)';
   g.lineWidth = 2;
@@ -115,6 +122,7 @@ function makeFacadeMaterial(nightUniform) {
         `#include <color_fragment>
         vec3 facadeN = normalize(vWorldNormal);
         float winLit = 0.0;
+        float winSeed = 0.0;
         if (abs(facadeN.y) < 0.5) {
           vec2 wall = abs(facadeN.x) > 0.5 ? vec2(vWorldPos.z, vWorldPos.y) : vec2(vWorldPos.x, vWorldPos.y);
           float shop = 1.0 - step(4.6, wall.y);
@@ -123,6 +131,7 @@ function makeFacadeMaterial(nightUniform) {
           vec2 f = fract(wall / bay);
           float frame = step(0.16, f.x) * step(f.x, 0.84) * step(0.2, f.y) * step(f.y, 0.86);
           float seed = fract(sin(dot(cell, vec2(41.73, 289.31))) * 43758.5453);
+          winSeed = seed;
           winLit = frame * step(0.34, seed);
           diffuseColor.rgb *= mix(1.0, 0.74, frame * 0.9);
           vec3 glassDay = vec3(0.40, 0.54, 0.66);
@@ -135,7 +144,9 @@ function makeFacadeMaterial(nightUniform) {
       .replace(
         '#include <emissivemap_fragment>',
         `#include <emissivemap_fragment>
-        totalEmissiveRadiance += vec3(1.0, 0.82, 0.52) * winLit * uNight * 2.1;`,
+        // Warm rooms and cool ones, bright and dim: a lit facade, not a white grid.
+        vec3 litColour = mix(vec3(1.0, 0.76, 0.44), vec3(0.78, 0.90, 1.0), step(0.68, winSeed));
+        totalEmissiveRadiance += litColour * winLit * uNight * (0.9 + 1.1 * winSeed);`,
       );
   };
   material.customProgramCacheKey = () => 'neon-facade';
@@ -410,6 +421,11 @@ export function createWorld(scene) {
         });
       }
     }
+    // Mid-block lamps too: a street lit every thirty-five metres reads as a street, not a runway.
+    for (const side of [-1, 1]) {
+      lampSpots.push({ x: block.x, z: block.z + side * (BLOCK_HALF - 1.4), rot: 0 });
+      lampSpots.push({ x: block.x + side * (BLOCK_HALF - 1.4), z: block.z, rot: Math.PI / 2 });
+    }
   }
   const poles = new THREE.InstancedMesh(poleGeo, poleMat, lampSpots.length);
   const heads = new THREE.InstancedMesh(headGeo, headMat, lampSpots.length);
@@ -450,6 +466,99 @@ export function createWorld(scene) {
   scene.add(poles);
   scene.add(heads);
   scene.add(pools);
+
+  // A halo on every lamp head: two crossed quads, so the light reads from any direction at night.
+  const lampGlowMat = new THREE.MeshBasicMaterial({
+    map: glowTexture(), color: 0xffd9a0, transparent: true, opacity: 0,
+    depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false, side: THREE.DoubleSide,
+  });
+  const lampGlowGeo = new THREE.PlaneGeometry(3.4, 3.4);
+  const lampGlow = new THREE.InstancedMesh(lampGlowGeo, lampGlowMat, lampSpots.length * 2);
+  lampSpots.forEach((spot, index) => {
+    for (let cross = 0; cross < 2; cross += 1) {
+      matrix.makeRotationY(spot.rot + (cross ? Math.PI / 2 : 0));
+      matrix.setPosition(spot.x, 6.15, spot.z);
+      lampGlow.setMatrixAt(index * 2 + cross, matrix);
+    }
+  });
+  lampGlow.instanceMatrix.needsUpdate = true;
+  lampGlow.frustumCulled = false;
+  scene.add(lampGlow);
+
+  // ---- wet road: a long shine under every lamp and a handful of puddles ----
+  // Both are invisible at noon; at night they carry the streetlights across the asphalt, and in the
+  // rain (`?rain=1`, or the night screenshot) they do it hard enough to read as water.
+  const sheenCanvas = document.createElement('canvas');
+  sheenCanvas.width = 32;
+  sheenCanvas.height = 128;
+  const sheenContext = sheenCanvas.getContext('2d');
+  const sheenGradient = sheenContext.createLinearGradient(0, 0, 0, 128);
+  sheenGradient.addColorStop(0, 'rgba(255, 232, 186, 0)');
+  sheenGradient.addColorStop(0.42, 'rgba(255, 232, 186, 0.5)');
+  sheenGradient.addColorStop(0.62, 'rgba(255, 244, 214, 0.72)');
+  sheenGradient.addColorStop(1, 'rgba(255, 232, 186, 0)');
+  sheenContext.fillStyle = sheenGradient;
+  sheenContext.fillRect(0, 0, 32, 128);
+  // Fade the streak across its width as well, so it melts into the asphalt instead of ending in a line.
+  const sheenEdge = sheenContext.createLinearGradient(0, 0, 32, 0);
+  sheenEdge.addColorStop(0, 'rgba(0, 0, 0, 0)');
+  sheenEdge.addColorStop(0.5, 'rgba(0, 0, 0, 1)');
+  sheenEdge.addColorStop(1, 'rgba(0, 0, 0, 0)');
+  sheenContext.globalCompositeOperation = 'destination-in';
+  sheenContext.fillStyle = sheenEdge;
+  sheenContext.fillRect(0, 0, 32, 128);
+  sheenContext.globalCompositeOperation = 'source-over';
+  const sheenTexture = new THREE.CanvasTexture(sheenCanvas);
+  const sheenMat = new THREE.MeshBasicMaterial({
+    map: sheenTexture, color: 0xffe1ad, transparent: true, opacity: 0,
+    depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
+  });
+  const sheenGeo = new THREE.PlaneGeometry(1, 1);
+  sheenGeo.rotateX(-Math.PI / 2);
+  const sheenSpots = [];
+  const sheenStep = 16;
+  for (let k = 0; k <= CITY.grid; k += 1) {
+    const line = roadLine(k);
+    for (let s = -HALF + 8; s < HALF - 8; s += sheenStep) {
+      for (const side of [-1, 1]) {
+        // A streak down each kerb of every street, so the wet road runs with the traffic.
+        sheenSpots.push({ x: s, z: line + side * (ROAD_HALF - 2.1), w: 4.2, l: 18, rot: 0 });
+        sheenSpots.push({ x: line + side * (ROAD_HALF - 2.1), z: s, w: 4.2, l: 18, rot: Math.PI / 2 });
+      }
+    }
+  }
+  const sheen = new THREE.InstancedMesh(sheenGeo, sheenMat, sheenSpots.length);
+  sheenSpots.forEach((spot, index) => {
+    matrix.makeRotationY(spot.rot);
+    matrix.scale(new THREE.Vector3(spot.w, 1, spot.l));
+    matrix.setPosition(spot.x, 0.052, spot.z);
+    sheen.setMatrixAt(index, matrix);
+  });
+  sheen.instanceMatrix.needsUpdate = true;
+  sheen.frustumCulled = false;
+  scene.add(sheen);
+
+  const puddleGeo = mergeParts([disc(1, 0, 0, 0, 0xffffff, 20)]);
+  const puddleMat = new THREE.MeshBasicMaterial({
+    color: 0x9dc2e6, transparent: true, opacity: 0, depthWrite: false,
+    blending: THREE.AdditiveBlending, toneMapped: false,
+  });
+  const puddleCount = 54;
+  const puddles = new THREE.InstancedMesh(puddleGeo, puddleMat, puddleCount);
+  for (let n = 0; n < puddleCount; n += 1) {
+    const alongX = random() < 0.5;
+    const line = roadLine(int(random, 0, CITY.grid));
+    const along = range(random, -HALF + 12, HALF - 12);
+    const lateral = range(random, -4.6, 4.6);
+    const scale = range(random, 1.4, 3.6);
+    matrix.makeRotationY(random() * Math.PI);
+    matrix.scale(new THREE.Vector3(scale, 1, scale * range(random, 0.5, 0.9)));
+    matrix.setPosition(alongX ? along : line + lateral, 0.054, alongX ? line + lateral : along);
+    puddles.setMatrixAt(n, matrix);
+  }
+  puddles.instanceMatrix.needsUpdate = true;
+  puddles.frustumCulled = false;
+  scene.add(puddles);
 
   // ---- palms down the sidewalks and along the sand ----
   const palmGeo = mergeParts(palmParts());
@@ -622,37 +731,77 @@ export function createWorld(scene) {
     return offsetX <= BLOCK_HALF && offsetZ <= BLOCK_HALF ? 0.24 : 0;
   }
 
-  // ---- time of day ----
+  // ---- time of day and weather ----
   const day = new THREE.Color(PALETTE.skyTopDay);
   const nightSky = new THREE.Color(PALETTE.skyTopNight);
+  const stormSky = new THREE.Color(PALETTE.skyTopStorm);
   const dayLow = new THREE.Color(PALETTE.skyBottomDay);
   const nightLow = new THREE.Color(PALETTE.skyBottomNight);
+  const stormLow = new THREE.Color(PALETTE.skyBottomStorm);
   const dayFog = new THREE.Color(PALETTE.fogDay);
   const nightFog = new THREE.Color(PALETTE.fogNight);
+  const stormFog = new THREE.Color(PALETTE.fogStorm);
   const daySun = new THREE.Color(PALETTE.sunDay);
   const nightSun = new THREE.Color(PALETTE.sunNight);
   const skyFill = new THREE.Color(0xcfe8ff);
+  const wetColour = new THREE.Color(0x6f7c8c);
 
   let timeOfDay = 0;
-  function setTimeOfDay(value) {
-    timeOfDay = Math.max(0, Math.min(1, value));
+  let wet = 0.35;
+  let rainy = false;
+
+  /** Paint sky, fog and light for the current hour and weather; setTimeOfDay and setRain share it. */
+  function paintSky() {
     skyUniforms.topColor.value.copy(day).lerp(nightSky, timeOfDay);
     skyUniforms.bottomColor.value.copy(dayLow).lerp(nightLow, timeOfDay);
     skyUniforms.sunColor.value.copy(daySun).lerp(nightSun, timeOfDay);
+    if (rainy) {
+      skyUniforms.topColor.value.lerp(stormSky, 0.62);
+      skyUniforms.bottomColor.value.lerp(stormLow, 0.7);
+      skyUniforms.sunColor.value.lerp(stormFog, 0.55);
+    }
     fog.color.copy(dayFog).lerp(nightFog, timeOfDay);
     fog.near = 120 - timeOfDay * 55;
     fog.far = 620 - timeOfDay * 190;
+    if (rainy) {
+      fog.color.lerp(stormFog, 0.55);
+      fog.near *= 0.52;
+      fog.far *= 0.56;
+    }
     sun.color.copy(daySun).lerp(nightSun, timeOfDay);
-    sun.intensity = 1.6 - timeOfDay * 1.28;
-    hemi.intensity = 0.8 - timeOfDay * 0.42;
+    sun.intensity = (1.6 - timeOfDay * 1.28) * (rainy ? 0.52 : 1);
+    hemi.intensity = (0.8 - timeOfDay * 0.42) * (rainy ? 0.78 : 1);
     hemi.color.copy(skyFill).lerp(nightSky, timeOfDay);
-    ambient.intensity = 0.28 + timeOfDay * 0.42;
+    ambient.intensity = (0.28 + timeOfDay * 0.42) * (rainy ? 1.18 : 1);
     nightUniform.value = timeOfDay;
     headMat.emissiveIntensity = 0.12 + timeOfDay * 2.4;
-    poolMat.opacity = timeOfDay * 0.75;
+    lampGlowMat.opacity = timeOfDay * 0.8;
     headMat.color.setHex(timeOfDay > 0.4 ? 0xffe6bc : 0x6b6455);
     signMat.opacity = 0.14 + timeOfDay * 0.86;
     sea.material.color.setHex(timeOfDay > 0.5 ? 0x123047 : 0x2f7ea8);
+    if (rainy) sea.material.color.lerp(wetColour, 0.35);
+    // The road: a wet street holds the light of its lamps, and is darker than a dry one.
+    poolMat.opacity = Math.min(1, timeOfDay * (0.62 + wet * 0.5));
+    sheenMat.opacity = timeOfDay * (WEATHER.sheenNight + wet * 0.85) * 0.95;
+    puddleMat.opacity = timeOfDay * (0.05 + wet * 0.28);
+    ground.material.color.setRGB(1 - wet * 0.16, 1 - wet * 0.15, 1 - wet * 0.12);
+  }
+
+  function setTimeOfDay(value) {
+    timeOfDay = Math.max(0, Math.min(1, value));
+    paintSky();
+  }
+
+  /** 0 keeps the asphalt dry, 1 makes it a mirror: the night screenshot uses 1. */
+  function setWet(value) {
+    wet = Math.max(0, Math.min(1, value));
+    paintSky();
+  }
+
+  /** `?rain=1`: a darker sky, nearer fog and the shower itself (the drops live in effects.js). */
+  function setRain(on) {
+    rainy = Boolean(on);
+    setWet(rainy ? 1 : 0.35);
   }
 
   /** Follow the action with the shadow camera, so the whole 560-metre city never needs one map. */
@@ -674,6 +823,8 @@ export function createWorld(scene) {
     sea,
     ground,
     setTimeOfDay,
+    setWet,
+    setRain,
     update,
     collideCircle,
     rayDistance,

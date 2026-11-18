@@ -1,6 +1,9 @@
-// Every number the city is built from, in one place: the street grid, the player's speeds, the
-// cars' handling, the police's aggression, the mission rewards and the palette. Tuning the game
-// means editing this file, not hunting through the systems.
+// Every number the city and its people are built from, in one place: the street grid, the player's
+// speeds and walk cycle, the cars' handling, the police's aggression, the mission rewards, the
+// weather and the palette. Tuning the game means editing this file, not hunting through the systems.
+//
+// The walk-cycle numbers are in metres per stride, not seconds: a cycle advances with distance
+// travelled, so the legs stay in step whether the body is walking, jogging or sprinting.
 
 /** The street grid: `grid` blocks a side, each cell `cell` metres across with a `road`-wide street. */
 export const CITY = {
@@ -28,6 +31,15 @@ export const PLAYER = {
   regen: 5.5,
   regenDelay: 7,
   carReach: 3.4,
+  // The walk cycle: one full stride (both legs) per `stride` metres walked, with the cadence
+  // tightening as the body speeds up. `swing` is the peak leg angle in radians.
+  stride: 2.5,
+  runStride: 3.1,
+  swing: 0.62,
+  armSwing: 0.48,
+  bob: 0.045,
+  lean: 0.055,
+  turnRate: 9.5,
 };
 
 export const CAMERA = {
@@ -69,6 +81,12 @@ export const PEDS = {
   count: 220,
   speed: 1.35,
   speedJitter: 0.5,
+  // A person on the pavement now and then stops at the corner: a short beat, never a freeze.
+  pauseChance: 0.45,
+  pauseMin: 0.35,
+  pauseMax: 1.5,
+  stride: 1.55,
+  swing: 0.55,
 };
 
 export const WANTED = {
@@ -76,6 +94,8 @@ export const WANTED = {
   decay: 2.6,
   decayDelay: 9,
   maxCars: 4,
+  // The first cruiser of a fresh chase appears this far behind the player instead of off-screen.
+  firstSpawn: 26,
 };
 
 export const CRIME = {
@@ -93,6 +113,16 @@ export const MISSIONS = {
   crewCount: 5,
 };
 
+export const WEATHER = {
+  // `?rain=1`: a light shower, a darker sky and a wet road.
+  drops: 900,
+  area: 46,
+  top: 22,
+  fall: 26,
+  // How much of the wet-road sheen is on when it is merely night (0) versus raining (1).
+  sheenNight: 0.45,
+};
+
 export const SAVE_KEY = 'neon-city.save.v1';
 
 /** The city's paint: sun-bleached coral, mint and sand, with glass towers behind it. */
@@ -101,8 +131,11 @@ export const PALETTE = {
   skyBottomDay: 0xf7e6c9,
   skyTopNight: 0x070f2a,
   skyBottomNight: 0x2b2f5c,
+  skyTopStorm: 0x1b2a3a,
+  skyBottomStorm: 0x6a6f78,
   fogDay: 0xe4e0d4,
   fogNight: 0x121a33,
+  fogStorm: 0x5f6773,
   sunDay: 0xfff4da,
   sunNight: 0x8fa8d8,
   asphalt: 0x4b4d52,

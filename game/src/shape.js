@@ -1,5 +1,7 @@
 // Geometry helpers. Every character and vehicle is a handful of boxes, cylinders and spheres merged
 // into one buffer with its colours baked in, so a car is one draw call and a whole crowd is one.
+// Limbs are the exception: a leg or an arm has to swing about a joint, so it is merged about its own
+// pivot (the origin sits at the hip or the shoulder) and the mesh is rotated in place.
 //
 // `THREE` is the global the classic <script src="./vendor/three.min.js"> above puts on the page;
 // the modules below it read it directly, which keeps the import graph to the game's own files.
@@ -64,6 +66,17 @@ export function cylinder(radiusTop, radiusBottom, height, segments, x, y, z, col
 export function ball(radius, x, y, z, color, segments = 8) {
   const geo = new THREE.SphereGeometry(radius, segments, Math.max(4, segments - 2));
   const matrix = new THREE.Matrix4().setPosition(x, y, z);
+  return { geo, matrix, color };
+}
+
+/**
+ * A flat disc lying on the ground, for puddles and the shine a lamp leaves on a wet road. It is a
+ * circle in the XZ plane, so the caller can scale it into a long streak without re-baking it.
+ */
+export function disc(radius, x, y, z, color, segments = 18) {
+  const geo = new THREE.CircleGeometry(radius, segments);
+  const matrix = new THREE.Matrix4().makeRotationX(-Math.PI / 2);
+  matrix.setPosition(x, y, z);
   return { geo, matrix, color };
 }
 

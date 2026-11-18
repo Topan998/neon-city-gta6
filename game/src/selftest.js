@@ -1,6 +1,8 @@
 // A headless smoke test of the systems, run by `?selftest=1`: it drives the same functions the
 // player does — walk, take a car, drive, fire, raise the heat — for a few simulated seconds each and
 // writes a JSON report into #status, so a browser run without a human can prove the game works.
+// It also checks the things a screenshot cannot prove on its own: that the walk cycle advanced, that
+// a cruiser's bar is flashing, and that the weather can be switched on and off.
 
 export function runSelfTest(api) {
   const report = { steps: 0, errors: [] };
@@ -16,13 +18,14 @@ export function runSelfTest(api) {
     api.startGame();
     report.mode = state.mode;
 
-    // Walking: hold W for a second and see the player move.
+    // Walking: hold W for a second and see the player move, and the legs keep step with it.
     const startX = player.state.x;
     const startZ = player.state.z;
     input.setKey('KeyW', true);
     step(60);
     input.setKey('KeyW', false);
     report.walked = Math.hypot(player.state.x - startX, player.state.z - startZ) > 1.5;
+    report.walkCycle = player.state.walkPhase > 1;
 
     // Getting in a car: stand next to one, press F, check the seat.
     const car = vehicles.cars.find((entry) => entry.driver === 'none' && entry.kind === 'coupe');
@@ -72,6 +75,16 @@ export function runSelfTest(api) {
     step(240);
     report.policeUnits = police.units.length > 0;
     report.officers = police.officers.length;
+    report.lightBar = police.units.length > 0
+      ? police.units[0].red.visible !== police.units[0].blue.visible
+      : false;
+
+    // The weather flips on and off without throwing.
+    world.setRain(true);
+    api.effects.setRain(true);
+    report.rain = world.timeOfDay >= 0;
+    world.setRain(false);
+    api.effects.setRain(false);
 
     // A job can be staged and its marker shown.
     missions.stage('cobalt-sweep');
@@ -80,7 +93,8 @@ export function runSelfTest(api) {
     report.objectiveShown = document.getElementById('objective').classList.contains('show');
 
     report.ground = world.groundHeight(0, 0) >= 0;
-    report.ok = report.walked && report.enteredCar && report.drove && report.steered && report.heatRose;
+    report.ok = report.walked && report.walkCycle && report.enteredCar && report.drove
+      && report.steered && report.heatRose && report.lightBar;
   } catch (error) {
     report.errors.push(String(error && error.stack ? error.stack : error));
     report.ok = false;

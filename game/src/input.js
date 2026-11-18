@@ -1,13 +1,14 @@
 // Keyboard, mouse and pointer lock in one small object. Held keys answer every frame; presses that
-// must happen once (start, pause, enter a car, fire, save) are queued as flags the loop takes, so a
-// press between two frames is never lost and never counted twice. A screenshot scene turns the real
-// listeners off with `goSimulated` and steers through `setKey`/`press`/`fire` instead.
+// must happen once (start, pause, enter a car, fire, save, the weather) are queued as flags the loop
+// takes, so a press between two frames is never lost and never counted twice. A screenshot scene
+// turns the real listeners off with `goSimulated` and steers through `setKey`/`press`/`fire` instead.
 
 export const ACTION_START = 1;
 export const ACTION_PAUSE = 2;
 export const ACTION_ENTER_CAR = 4;
 export const ACTION_SAVE_QUIT = 8;
 export const ACTION_RESTART = 16;
+export const ACTION_TOGGLE_RAIN = 32;
 
 const PREVENT = new Set([
   'KeyW', 'KeyA', 'KeyS', 'KeyD', 'Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
@@ -31,6 +32,7 @@ export function createInput(canvas) {
     if (event.code === 'KeyF') actions |= ACTION_ENTER_CAR;
     if (event.code === 'KeyQ') actions |= ACTION_SAVE_QUIT;
     if (event.code === 'KeyR') actions |= ACTION_RESTART;
+    if (event.code === 'KeyT') actions |= ACTION_TOGGLE_RAIN;
   });
   window.addEventListener('keyup', (event) => { held.delete(event.code); });
   // A key released while the tab is hidden never sends keyup: drop every key on blur.
