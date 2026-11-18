@@ -1,255 +1,248 @@
-// Small visual events: bullet tracers, sparks, blood, dust and the fireball of a wreck, plus the
-// rain of `?rain=1`. Everything is pooled — a fixed number of points and lines made at boot — so
-// combat and weather never allocate, and every particle draws from a seeded generator so a staged
-// screenshot is the same picture on every run.
+// effects.js — muzzle flashes, impact sparks, tyre smoke, hit puffs and screen shake.
 //
-// `glowTexture` is the shared soft dot the police light bar and the headlights bloom with.
+// Two pooled THREE.Points systems (hot sparks and soft smoke) plus a single reusable flash card. Pools
+// are fixed at construction, so nothing allocates while the game runs; the RNG is seeded so a staged
+// screenshot can fire the same sparks every time.
 
-import { WEATHER } from './config.js';
-import { createRandom } from './random.js';
+import THREE from './three-shim.js';
+import { RNG, clamp, TAU, radialTexture } from './util.js';
 
-const MAX_PARTICLES = 420;
-const MAX_TRACERS = 24;
+const MAX_SPARKS = 260;
+const MAX_SMOKE = 180;
 
-let glow = null;
-
-/** A soft white radial dot, made once, tinted per use by a SpriteMaterial. */
-export function glowTexture() {
-  if (glow) return glow;
-  const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = 128;
-  const g = canvas.getContext('2d');
-  const gradient = g.createRadialGradient(64, 64, 2, 64, 64, 62);
-  gradient.addColorStop(0, 'rgba(255,255,255,1)');
-  gradient.addColorStop(0.25, 'rgba(255,255,255,0.72)');
-  gradient.addColorStop(0.6, 'rgba(255,255,255,0.18)');
-  gradient.addColorStop(1, 'rgba(255,255,255,0)');
-  g.fillStyle = gradient;
-  g.fillRect(0, 0, 128, 128);
-  glow = new THREE.CanvasTexture(canvas);
-  glow.colorSpace = THREE.SRGBColorSpace;
-  return glow;
+function softTexture(inner, outer) {
+  return radialTexture(64, inner, outer);
 }
 
-export function createEffects(scene) {
-  const random = createRandom(5531);
-  const positions = new Float32Array(MAX_PARTICLES * 3);
-  const colours = new Float32Array(MAX_PARTICLES * 3);
-  const velocities = new Float32Array(MAX_PARTICLES * 3);
-  const lives = new Float32Array(MAX_PARTICLES);
-  const maxLives = new Float32Array(MAX_PARTICLES);
-  const sizes = new Float32Array(MAX_PARTICLES);
-  let cursor = 0;
+export class Effects {
+  constructor(scene, camera, rng) {
+    this.scene = scene;
+    this.camera = camera;
+    this.rng = rng || new RNG(99);
 
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colours, 3));
-  const points = new THREE.Points(
-    geometry,
-    new THREE.PointsMaterial({
-      size: 0.24, vertexColors: true, transparent: true, opacity: 0.95,
-      depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true,
-    }),
-  );
-  points.frustumCulled = false;
-  scene.add(points);
-
-  const tracers = [];
-  const tracerMaterial = new THREE.LineBasicMaterial({
-    color: 0xffe9a8, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false,
-  });
-  for (let i = 0; i < MAX_TRACERS; i += 1) {
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(6), 3));
-    const line = new THREE.Line(geo, tracerMaterial.clone());
-    line.frustumCulled = false;
-    line.visible = false;
-    scene.add(line);
-    tracers.push({ line, life: 0 });
-  }
-  let tracerCursor = 0;
-
-  // All particles start dead and far away.
-  for (let i = 0; i < MAX_PARTICLES; i += 1) positions[i * 3 + 1] = -999;
-
-  const colourCache = new Map();
-  function tint(colour) {
-    let entry = colourCache.get(colour);
-    if (!entry) {
-      entry = new THREE.Color(colour);
-      colourCache.set(colour, entry);
+    // Sparks: additive points, warm, short lived.
+    const sparkGeo = new THREE.BufferGeometry();
+    this.sparkPos = new Float32Array(MAX_SPARKS * 3);
+    this.sparkCol = new Float32Array(MAX_SPARKS * 3);
+    for (let i = 0; i < MAX_SPARKS; i++) this.sparkPos[i * 3 + 1] = -999;
+    sparkGeo.setAttribute('position', new THREE.BufferAttribute(this.sparkPos, 3));
+    sparkGeo.setAttribute('color', new THREE.BufferAttribute(this.sparkCol, 3));
+    const sparkMat = new THREE.PointsMaterial({
+      size: 0.22,
+      map: softTexture('rgba(255,255,255,1)', 'rgba(255,180,80,0)'),
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      vertexColors: true,
+      sizeAttenuation: true,
+      opacity: 0.95,
+    });
+    this.sparks = new THREE.Points(sparkGeo, sparkMat);
+    this.sparks.frustumCulled = false;
+    scene.add(this.sparks);
+    this.sparkState = [];
+    for (let i = 0; i < MAX_SPARKS; i++) {
+      this.sparkState.push({ life: 0, vx: 0, vy: 0, vz: 0, grav: 1 });
     }
-    return entry;
+    this.sparkCursor = 0;
+
+    // Smoke / dust: soft alpha points that rise and fade.
+    const smokeGeo = new THREE.BufferGeometry();
+    this.smokePos = new Float32Array(MAX_SMOKE * 3);
+    this.smokeCol = new Float32Array(MAX_SMOKE * 3);
+    for (let i = 0; i < MAX_SMOKE; i++) this.smokePos[i * 3 + 1] = -999;
+    smokeGeo.setAttribute('position', new THREE.BufferAttribute(this.smokePos, 3));
+    smokeGeo.setAttribute('color', new THREE.BufferAttribute(this.smokeCol, 3));
+    const smokeMat = new THREE.PointsMaterial({
+      size: 1.6,
+      map: softTexture('rgba(255,255,255,0.55)', 'rgba(255,255,255,0)'),
+      transparent: true,
+      depthWrite: false,
+      vertexColors: true,
+      sizeAttenuation: true,
+      opacity: 0.55,
+    });
+    this.smoke = new THREE.Points(smokeGeo, smokeMat);
+    this.smoke.frustumCulled = false;
+    scene.add(this.smoke);
+    this.smokeState = [];
+    for (let i = 0; i < MAX_SMOKE; i++) this.smokeState.push({ life: 0, vx: 0, vy: 0, vz: 0 });
+    this.smokeCursor = 0;
+
+    // Muzzle flash: one small additive card that follows the camera.
+    const flashTex = softTexture('rgba(255,255,240,1)', 'rgba(255,170,60,0)');
+    this.flash = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: flashTex,
+        color: 0xffe6b0,
+        blending: THREE.AdditiveBlending,
+        transparent: true,
+        depthWrite: false,
+        opacity: 0,
+      }),
+    );
+    this.flash.scale.set(1.6, 1.6, 1);
+    scene.add(this.flash);
+    this.flashLife = 0;
+
+    this.shake = 0;
+    this.tyreAccum = 0;
   }
 
-  function spawn(x, y, z, vx, vy, vz, colour, life, size) {
-    const index = cursor;
-    cursor = (cursor + 1) % MAX_PARTICLES;
-    positions[index * 3] = x;
-    positions[index * 3 + 1] = y;
-    positions[index * 3 + 2] = z;
-    velocities[index * 3] = vx;
-    velocities[index * 3 + 1] = vy;
-    velocities[index * 3 + 2] = vz;
-    const c = tint(colour);
-    colours[index * 3] = c.r;
-    colours[index * 3 + 1] = c.g;
-    colours[index * 3 + 2] = c.b;
-    lives[index] = life;
-    maxLives[index] = life;
-    sizes[index] = size;
+  spark(x, y, z, n = 8, power = 1) {
+    for (let i = 0; i < n; i++) {
+      const idx = this.sparkCursor;
+      this.sparkCursor = (this.sparkCursor + 1) % MAX_SPARKS;
+      const st = this.sparkState[idx];
+      st.life = this.rng.range(0.25, 0.7);
+      st.maxLife = st.life;
+      st.vx = this.rng.range(-1, 1) * 5 * power;
+      st.vy = this.rng.range(0.4, 1.6) * 5 * power;
+      st.vz = this.rng.range(-1, 1) * 5 * power;
+      st.grav = 1;
+      this.sparkPos[idx * 3] = x;
+      this.sparkPos[idx * 3 + 1] = y;
+      this.sparkPos[idx * 3 + 2] = z;
+      const warm = this.rng.range(0.6, 1);
+      this.sparkCol[idx * 3] = 1;
+      this.sparkCol[idx * 3 + 1] = 0.55 + warm * 0.4;
+      this.sparkCol[idx * 3 + 2] = 0.2 + warm * 0.3;
+    }
+    this.sparks.geometry.attributes.position.needsUpdate = true;
+    this.sparks.geometry.attributes.color.needsUpdate = true;
   }
 
-  // ---- rain: one pool of drops that lives in a box around the camera ----
-  const dropCount = WEATHER.drops;
-  const dropGeometry = new THREE.BufferGeometry();
-  const dropPositions = new Float32Array(dropCount * 3);
-  const dropX = new Float32Array(dropCount);
-  const dropZ = new Float32Array(dropCount);
-  const dropPhase = new Float32Array(dropCount);
-  const dropSpeed = new Float32Array(dropCount);
-  for (let i = 0; i < dropCount; i += 1) {
-    dropX[i] = (random() - 0.5) * WEATHER.area * 2;
-    dropZ[i] = (random() - 0.5) * WEATHER.area * 2;
-    dropPhase[i] = random() * WEATHER.top;
-    dropSpeed[i] = WEATHER.fall * (0.82 + random() * 0.42);
+  smokePuff(x, y, z, n = 3, spread = 0.5, tone = 0.72) {
+    for (let i = 0; i < n; i++) {
+      const idx = this.smokeCursor;
+      this.smokeCursor = (this.smokeCursor + 1) % MAX_SMOKE;
+      const st = this.smokeState[idx];
+      st.life = this.rng.range(0.7, 1.8);
+      st.maxLife = st.life;
+      st.vx = this.rng.range(-1, 1) * spread;
+      st.vy = this.rng.range(0.25, 0.9);
+      st.vz = this.rng.range(-1, 1) * spread;
+      this.smokePos[idx * 3] = x + this.rng.range(-0.35, 0.35);
+      this.smokePos[idx * 3 + 1] = y + this.rng.range(0, 0.3);
+      this.smokePos[idx * 3 + 2] = z + this.rng.range(-0.35, 0.35);
+      this.smokeCol[idx * 3] = tone;
+      this.smokeCol[idx * 3 + 1] = tone;
+      this.smokeCol[idx * 3 + 2] = tone * 1.02;
+    }
+    this.smoke.geometry.attributes.position.needsUpdate = true;
+    this.smoke.geometry.attributes.color.needsUpdate = true;
   }
-  dropGeometry.setAttribute('position', new THREE.BufferAttribute(dropPositions, 3));
-  const rain = new THREE.Points(
-    dropGeometry,
-    new THREE.PointsMaterial({
-      color: 0xbfd6f2, size: 0.16, transparent: true, opacity: 0.5,
-      depthWrite: false, sizeAttenuation: true, fog: false,
-    }),
-  );
-  rain.frustumCulled = false;
-  rain.visible = false;
-  scene.add(rain);
 
-  return {
-    /** A short line from the muzzle to whatever the bullet found. */
-    tracer(from, to, colour = 0xffe9a8) {
-      const entry = tracers[tracerCursor];
-      tracerCursor = (tracerCursor + 1) % MAX_TRACERS;
-      const array = entry.line.geometry.getAttribute('position');
-      array.setXYZ(0, from.x, from.y, from.z);
-      array.setXYZ(1, to.x, to.y, to.z);
-      array.needsUpdate = true;
-      entry.line.material.color.setHex(colour);
-      entry.line.material.opacity = 0.95;
-      entry.line.visible = true;
-      entry.life = 0.07;
-    },
+  muzzle(x, y, z, dx, dz) {
+    this.flash.position.set(x + dx * 0.4, y, z + dz * 0.4);
+    this.flashLife = 0.055;
+    this.flash.material.opacity = 0.95;
+    this.flash.scale.setScalar(this.rng.range(1.3, 1.9));
+    this.spark(x, y, z, 4, 0.7);
+  }
 
-    /** Sparks off metal or concrete. */
-    sparks(x, y, z, normal = { x: 0, y: 1, z: 0 }, count = 8, colour = 0xffcf8a) {
-      for (let i = 0; i < count; i += 1) {
-        const spread = 4.5;
-        spawn(
-          x, y, z,
-          normal.x * 2 + (random() - 0.5) * spread,
-          Math.abs(normal.y) * 2 + random() * spread,
-          normal.z * 2 + (random() - 0.5) * spread,
-          colour, 0.28 + random() * 0.3, 0.16,
-        );
+  hit(x, y, z) {
+    this.smokePuff(x, y, z, 3, 0.7, 0.55);
+    this.spark(x, y, z, 3, 0.4);
+  }
+
+  dust(x, y, z, power = 1) {
+    this.smokePuff(x, y, z, 1, 0.35, 0.62);
+  }
+
+  tyre(x, y, z, intensity = 1) {
+    this.tyreAccum += intensity;
+    if (this.tyreAccum > 0.6) {
+      this.tyreAccum = 0;
+      this.smokePuff(x, y, z, 1, 0.5, 0.66);
+    }
+  }
+
+  tyreSmoke(car, dt) {
+    if (Math.abs(car.lateral) < 1.6 && !car.handbrake) return;
+    if (Math.abs(car.speed) < 3) return;
+    const backX = car.x - car.forwardX * 1.4;
+    const backZ = car.z - car.forwardZ * 1.4;
+    const rx = car.rightX * 0.85;
+    const rz = car.rightZ * 0.85;
+    this.tyre(backX + rx, 0.15, backZ + rz, 1);
+    this.tyre(backX - rx, 0.15, backZ - rz, 1);
+  }
+
+  update(dt) {
+    // Sparks.
+    let sparkDirty = false;
+    for (let i = 0; i < MAX_SPARKS; i++) {
+      const st = this.sparkState[i];
+      if (st.life <= 0) continue;
+      st.life -= dt;
+      const p = i * 3;
+      if (st.life <= 0) {
+        this.sparkPos[p + 1] = -999;
+        sparkDirty = true;
+        continue;
       }
-    },
-
-    blood(x, y, z) {
-      for (let i = 0; i < 7; i += 1) {
-        spawn(x, y, z, (random() - 0.5) * 4, random() * 3, (random() - 0.5) * 4, 0x9c1220, 0.4, 0.2);
+      st.vy -= 14 * st.grav * dt;
+      this.sparkPos[p] += st.vx * dt;
+      this.sparkPos[p + 1] += st.vy * dt;
+      this.sparkPos[p + 2] += st.vz * dt;
+      if (this.sparkPos[p + 1] < 0.02) {
+        this.sparkPos[p + 1] = 0.02;
+        st.vy = Math.abs(st.vy) * 0.28;
+        st.vx *= 0.6;
+        st.vz *= 0.6;
       }
-    },
+      const f = clamp(st.life / (st.maxLife || 1), 0, 1);
+      this.sparkCol[p] = f;
+      this.sparkCol[p + 1] = f * 0.72;
+      this.sparkCol[p + 2] = f * 0.35;
+      sparkDirty = true;
+    }
+    if (sparkDirty) {
+      this.sparks.geometry.attributes.position.needsUpdate = true;
+      this.sparks.geometry.attributes.color.needsUpdate = true;
+    }
 
-    dust(x, y, z) {
-      for (let i = 0; i < 5; i += 1) {
-        spawn(x, y, z, (random() - 0.5) * 2.4, random() * 1.6, (random() - 0.5) * 2.4, 0xcfc6b4, 0.5, 0.22);
+    // Smoke.
+    let smokeDirty = false;
+    for (let i = 0; i < MAX_SMOKE; i++) {
+      const st = this.smokeState[i];
+      if (st.life <= 0) continue;
+      st.life -= dt;
+      const p = i * 3;
+      if (st.life <= 0) {
+        this.smokePos[p + 1] = -999;
+        smokeDirty = true;
+        continue;
       }
-    },
+      this.smokePos[p] += st.vx * dt;
+      this.smokePos[p + 1] += st.vy * dt;
+      this.smokePos[p + 2] += st.vz * dt;
+      st.vx *= 1 - dt * 1.4;
+      st.vz *= 1 - dt * 1.4;
+      const f = clamp(st.life / (st.maxLife || 1), 0, 1);
+      const c = 0.1 + f * 0.7;
+      this.smokeCol[p] = c;
+      this.smokeCol[p + 1] = c;
+      this.smokeCol[p + 2] = c;
+      smokeDirty = true;
+    }
+    if (smokeDirty) {
+      this.smoke.geometry.attributes.position.needsUpdate = true;
+      this.smoke.geometry.attributes.color.needsUpdate = true;
+    }
 
-    explosion(x, y, z) {
-      for (let i = 0; i < 46; i += 1) {
-        spawn(
-          x, y, z,
-          (random() - 0.5) * 12,
-          random() * 9,
-          (random() - 0.5) * 12,
-          i % 3 === 0 ? 0xffe08a : i % 3 === 1 ? 0xff7a3c : 0x3a3a40,
-          0.6 + random() * 0.7, 0.5,
-        );
-      }
-    },
+    // Muzzle flash.
+    if (this.flashLife > 0) {
+      this.flashLife -= dt;
+      this.flash.material.opacity = Math.max(0, this.flashLife / 0.055) * 0.95;
+      if (this.flashLife <= 0) this.flash.material.opacity = 0;
+    }
 
-    /** Turn the shower on or off; the drops keep their offsets and just start falling. */
-    setRain(on) {
-      rain.visible = Boolean(on);
-    },
+    this.shake = Math.max(0, this.shake - dt * 1.6);
+  }
 
-    /** The shower: the box of drops is re-centred on whoever the camera is following. */
-    updateRain(dt, focus) {
-      if (!rain.visible || !focus) return;
-      const top = WEATHER.top;
-      for (let i = 0; i < dropCount; i += 1) {
-        dropPhase[i] += dropSpeed[i] * dt;
-        if (dropPhase[i] > top) dropPhase[i] -= top;
-        dropPositions[i * 3] = focus.x + dropX[i];
-        dropPositions[i * 3 + 1] = top - dropPhase[i];
-        dropPositions[i * 3 + 2] = focus.z + dropZ[i];
-      }
-      dropGeometry.getAttribute('position').needsUpdate = true;
-    },
-
-    update(dt) {
-      for (let i = 0; i < MAX_PARTICLES; i += 1) {
-        if (lives[i] <= 0) continue;
-        lives[i] -= dt;
-        if (lives[i] <= 0) {
-          positions[i * 3 + 1] = -999;
-          continue;
-        }
-        velocities[i * 3 + 1] -= 12 * dt;
-        positions[i * 3] += velocities[i * 3] * dt;
-        positions[i * 3 + 1] = Math.max(0.02, positions[i * 3 + 1] + velocities[i * 3 + 1] * dt);
-        positions[i * 3 + 2] += velocities[i * 3 + 2] * dt;
-        velocities[i * 3] *= 0.96;
-        velocities[i * 3 + 2] *= 0.96;
-        const fade = lives[i] / maxLives[i];
-        colours[i * 3] *= 0.995;
-        colours[i * 3 + 1] *= 0.995;
-        colours[i * 3 + 2] *= 0.995;
-        if (fade < 0.2) sizes[i] = Math.max(0.05, sizes[i] * 0.98);
-      }
-      geometry.getAttribute('position').needsUpdate = true;
-      geometry.getAttribute('color').needsUpdate = true;
-
-      for (const entry of tracers) {
-        if (entry.life <= 0) continue;
-        entry.life -= dt;
-        entry.line.material.opacity = Math.max(0, entry.life / 0.07) * 0.95;
-        if (entry.life <= 0) entry.line.visible = false;
-      }
-    },
-  };
-}
-
-/** A soft round shadow under a character, so nothing floats over the pavement in flat light. */
-export function createBlobShadow(scene, size = 1.1) {
-  const canvas = document.createElement('canvas');
-  canvas.width = 64;
-  canvas.height = 64;
-  const g = canvas.getContext('2d');
-  const gradient = g.createRadialGradient(32, 32, 2, 32, 32, 30);
-  gradient.addColorStop(0, 'rgba(0,0,0,0.55)');
-  gradient.addColorStop(1, 'rgba(0,0,0,0)');
-  g.fillStyle = gradient;
-  g.fillRect(0, 0, 64, 64);
-  const texture = new THREE.CanvasTexture(canvas);
-  const mesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(size, size),
-    new THREE.MeshBasicMaterial({ map: texture, transparent: true, depthWrite: false }),
-  );
-  mesh.rotation.x = -Math.PI / 2;
-  mesh.position.y = 0.03;
-  scene.add(mesh);
-  return mesh;
+  addShake(amount) {
+    this.shake = Math.min(1.4, this.shake + amount);
+  }
 }

@@ -1,204 +1,60 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Neon City — Saltwater Vice</title>
-<style>
-  :root {
-    --mint: #5ef2c8;
-    --coral: #ff5f7e;
-    --gold: #ffd166;
-    --ink: #070b14;
-    --panel: rgba(9, 14, 26, 0.58);
-    --line: rgba(255, 255, 255, 0.16);
-  }
-  * { box-sizing: border-box; }
-  html, body {
-    margin: 0; height: 100%; overflow: hidden; background: var(--ink); color: #eaf2ff;
-    font-family: "Trebuchet MS", "Segoe UI", system-ui, -apple-system, sans-serif;
-    -webkit-font-smoothing: antialiased; user-select: none;
-  }
-  #game { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Neon City — Saltwater Vice</title>
+    <meta name="description" content="An open-world crime game in a rain-slick neon city. Three jobs, five stars, one city. Runs offline in the browser." />
+    <style>
+      :root { color-scheme: dark; }
+      * { margin: 0; padding: 0; }
+      html, body { width: 100%; height: 100%; overflow: hidden; background: #06080c; }
+      canvas#scene { display: block; width: 100vw; height: 100vh; outline: none; cursor: crosshair; }
+      #boot-error {
+        display: none; position: fixed; left: 24px; bottom: 24px; max-width: 640px; z-index: 50;
+        font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #ffb3a3; background: rgba(20, 8, 10, 0.9); border: 1px solid rgba(255, 120, 100, 0.4);
+        padding: 14px 18px; border-radius: 10px; white-space: pre-wrap;
+      }
+      #boot-note {
+        position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+        pointer-events: none; z-index: 5;
+        font: 700 12px/1.6 "Helvetica Neue", Helvetica, Arial, sans-serif;
+        letter-spacing: 4px; color: rgba(220, 235, 250, 0.5);
+      }
+      /* The screenshot path pins the whole page to exactly 1280x720 so a capture is stable. */
+      html.shot-mode, html.shot-mode body { width: 1280px; height: 720px; overflow: hidden; }
+      html.shot-mode canvas#scene { width: 1280px; height: 720px; }
+      html.shot-mode #hud, html.shot-mode #start, html.shot-mode #pause {
+        width: 1280px; height: 720px; inset: auto; left: 0; top: 0;
+      }
+      html.shot-mode #boot-note { display: none !important; }
+    </style>
+  </head>
+  <body>
+    <canvas id="scene" tabindex="0"></canvas>
+    <div id="boot-note">BUILDING THE CITY…</div>
+    <div id="boot-error"></div>
 
-  /* ---- heads-up display ---- */
-  #hud { position: fixed; inset: 0; pointer-events: none; opacity: 0; transition: opacity .4s ease; }
-  body.playing #hud { opacity: 1; }
-  .card {
-    background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-    box-shadow: 0 12px 34px rgba(0, 0, 0, .38); backdrop-filter: blur(6px);
-  }
-  .label { font-size: 10px; letter-spacing: .22em; text-transform: uppercase; color: rgba(234, 242, 255, .58); }
-
-  #top-left { position: absolute; left: 26px; top: 24px; display: flex; flex-direction: column; gap: 8px; }
-  #cash { display: flex; align-items: baseline; gap: 10px; padding: 8px 16px 9px; }
-  #money { font-size: 27px; font-weight: 700; color: var(--mint); letter-spacing: .01em;
-           text-shadow: 0 0 22px rgba(94, 242, 200, .45); font-variant-numeric: tabular-nums; }
-  #jobs { display: flex; align-items: baseline; gap: 10px; padding: 6px 16px 8px; }
-  #job-count { font-size: 15px; font-weight: 700; letter-spacing: .06em; color: var(--gold); }
-
-  #wanted { position: absolute; right: 26px; top: 24px; display: flex; gap: 5px; padding: 7px 12px; }
-  #wanted i {
-    width: 17px; height: 17px; display: block; font-style: normal; font-size: 17px; line-height: 17px;
-    text-align: center; color: rgba(255, 255, 255, .18);
-  }
-  #wanted i.on { color: var(--gold); text-shadow: 0 0 12px rgba(255, 209, 102, .8); }
-  #wanted.hot i.on { color: var(--coral); text-shadow: 0 0 14px rgba(255, 95, 126, .9); animation: pulse .9s infinite; }
-  #wanted.rising i.on { animation: star-rise .32s ease-in-out infinite alternate; }
-  @keyframes pulse { 50% { opacity: .45; } }
-  @keyframes star-rise { from { transform: scale(1); } to { transform: scale(1.5); } }
-
-  #objective {
-    position: absolute; left: 50%; top: 22px; transform: translateX(-50%);
-    min-width: 300px; max-width: 560px; padding: 9px 22px 10px; text-align: center; display: none;
-  }
-  #objective.show { display: block; }
-  #obj-title { font-size: 13px; letter-spacing: .2em; text-transform: uppercase; color: var(--coral); font-weight: 700; }
-  #obj-detail { font-size: 14px; margin-top: 3px; color: rgba(234, 242, 255, .9); }
-  #obj-timer { font-size: 12px; margin-top: 2px; color: var(--gold); letter-spacing: .1em; }
-
-  #bottom-left { position: absolute; left: 26px; bottom: 24px; width: 250px; padding: 9px 14px 11px; }
-  #health { height: 9px; margin-top: 6px; background: rgba(255, 255, 255, .12); border-radius: 6px; overflow: hidden; }
-  #health-fill { display: block; height: 100%; width: 100%; border-radius: 6px;
-    background: linear-gradient(90deg, #2ee6a8, #8ef5c9); box-shadow: 0 0 14px rgba(46, 230, 168, .6);
-    transition: width .18s linear, background .3s; }
-  #health-fill.low { background: linear-gradient(90deg, #ff3d5d, #ff8a6b); box-shadow: 0 0 14px rgba(255, 61, 93, .7); }
-  #hint { margin-top: 7px; font-size: 11px; color: rgba(234, 242, 255, .55); letter-spacing: .08em; }
-
-  #speedo { position: absolute; left: 50%; bottom: 26px; transform: translateX(-50%); display: none;
-            padding: 6px 20px 8px; text-align: center; }
-  #speedo.show { display: block; }
-  #speed { font-size: 30px; font-weight: 700; font-variant-numeric: tabular-nums; letter-spacing: .02em; }
-  #speedo .unit { font-size: 10px; letter-spacing: .24em; color: rgba(234, 242, 255, .55); margin-left: 6px; }
-  #gear { font-size: 11px; letter-spacing: .18em; color: var(--mint); }
-
-  #map-wrap { position: absolute; right: 26px; bottom: 24px; padding: 8px 8px 4px; border-radius: 12px; }
-  #minimap { display: block; width: 196px; height: 196px; border-radius: 8px; background: #0d1424; }
-  #map-caption { text-align: center; font-size: 9px; letter-spacing: .26em; color: rgba(234, 242, 255, .5); padding: 3px 0 1px; }
-
-  #crosshair { position: fixed; left: 50%; top: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px;
-    border-radius: 50%; background: rgba(255, 255, 255, .8); box-shadow: 0 0 8px rgba(0, 0, 0, .8); display: none; }
-  body.armed #crosshair { display: block; }
-
-  #toasts { position: absolute; left: 50%; bottom: 118px; transform: translateX(-50%); width: 520px;
-            display: flex; flex-direction: column; gap: 6px; align-items: center; }
-  .toast { padding: 7px 18px; border-radius: 8px; background: rgba(9, 14, 26, .72); border: 1px solid var(--line);
-           font-size: 13px; letter-spacing: .06em; opacity: 0; transform: translateY(8px);
-           transition: opacity .3s, transform .3s; }
-  .toast.show { opacity: 1; transform: none; }
-  .toast.good { color: var(--mint); border-color: rgba(94, 242, 200, .4); }
-  .toast.bad { color: var(--coral); border-color: rgba(255, 95, 126, .4); }
-
-  #vignette { position: fixed; inset: 0; pointer-events: none; opacity: 0;
-    background: radial-gradient(ellipse at center, transparent 42%, rgba(190, 12, 40, .62) 100%);
-    transition: opacity .18s; }
-  #vignette.hit { opacity: 1; }
-  #scanlines { position: fixed; inset: 0; pointer-events: none; opacity: .14;
-    background: repeating-linear-gradient(180deg, rgba(0, 0, 0, .5) 0 1px, transparent 1px 3px); }
-
-  /* ---- full screens ---- */
-  .screen { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
-            flex-direction: column; text-align: center; z-index: 20;
-            background: radial-gradient(ellipse at 50% 38%, rgba(24, 40, 78, .55), rgba(4, 7, 14, .92) 70%),
-                        linear-gradient(180deg, #0a1224, #05070f); }
-  .screen.hidden { display: none; }
-  #brand { font-size: 13px; letter-spacing: .5em; color: var(--mint); text-transform: uppercase; margin-bottom: 10px; }
-  #title { font-size: 92px; line-height: .92; font-weight: 800; letter-spacing: .06em; margin: 0;
-           color: #fff; text-shadow: 0 0 44px rgba(94, 242, 200, .38), 0 0 90px rgba(255, 95, 126, .25); }
-  #title span { color: var(--coral); }
-  #subtitle { margin-top: 12px; font-size: 15px; letter-spacing: .42em; text-transform: uppercase; color: rgba(234, 242, 255, .62); }
-  #controls { margin-top: 32px; display: grid; grid-template-columns: auto auto; gap: 8px 26px; font-size: 13px;
-              color: rgba(234, 242, 255, .78); text-align: left; }
-  #controls b { color: var(--gold); font-weight: 700; letter-spacing: .07em; }
-  #start-prompt { margin-top: 34px; font-size: 15px; letter-spacing: .3em; color: var(--mint);
-                  animation: breathe 1.8s ease-in-out infinite; }
-  @keyframes breathe { 50% { opacity: .4; } }
-  #save-note { margin-top: 14px; font-size: 11px; letter-spacing: .18em; color: rgba(234, 242, 255, .4); }
-  #footer { position: absolute; bottom: 22px; font-size: 10px; letter-spacing: .3em; color: rgba(234, 242, 255, .3); }
-
-  #pause h2, #wasted h2 { font-size: 46px; letter-spacing: .16em; margin: 0; font-weight: 800; }
-  #pause h2 { color: var(--mint); }
-  #wasted h2 { color: var(--coral); text-shadow: 0 0 40px rgba(255, 60, 90, .6); }
-  #pause p, #wasted p { color: rgba(234, 242, 255, .7); letter-spacing: .12em; font-size: 13px; margin-top: 12px; }
-
-  #status { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
-
-  /* A staged screenshot is a still: freeze every animated HUD element so two renders of the same
-     scene are identical to the byte. */
-  body.shot #hud, body.shot #hud * { animation: none !important; transition: none !important; }
-</style>
-</head>
-<body>
-<canvas id="game" aria-label="Neon City, an open-world crime game: drive, walk and take jobs in a sunlit coastal city"></canvas>
-
-<div id="hud">
-  <div id="top-left">
-    <div class="card" id="cash"><span class="label">cash</span><span id="money">$0</span></div>
-    <div class="card" id="jobs"><span class="label">jobs</span><span id="job-count">0 / 3</span></div>
-  </div>
-  <div class="card" id="wanted"><i>★</i><i>★</i><i>★</i><i>★</i><i>★</i></div>
-  <div class="card" id="objective">
-    <div id="obj-title"></div>
-    <div id="obj-detail"></div>
-    <div id="obj-timer"></div>
-  </div>
-  <div class="card" id="bottom-left">
-    <span class="label">condition</span>
-    <div id="health"><i id="health-fill"></i></div>
-    <div id="hint">F enter car · LMB fire · SHIFT sprint · T rain</div>
-  </div>
-  <div class="card" id="speedo"><span id="speed">0</span><span class="unit">km/h</span> <span id="gear">D</span></div>
-  <div class="card" id="map-wrap">
-    <canvas id="minimap" width="392" height="392"></canvas>
-    <div id="map-caption">Vice Coast</div>
-  </div>
-  <div id="toasts"></div>
-  <div id="vignette"></div>
-  <div id="crosshair"></div>
-</div>
-<div id="scanlines"></div>
-
-<div id="menu" class="screen">
-  <div id="brand">make.fun · gta6-01</div>
-  <h1 id="title">NEON <span>CITY</span></h1>
-  <div id="subtitle">Saltwater Vice</div>
-  <div id="controls">
-    <b>W A S D</b><span>walk the streets, drive the lanes</span>
-    <b>MOUSE</b><span>look around · click to lock the pointer</span>
-    <b>F</b><span>enter or leave a car</span>
-    <b>LEFT CLICK</b><span>fire your pistol</span>
-    <b>SHIFT</b><span>sprint · handbrake in a car</span>
-    <b>T</b><span>rain on, rain off</span>
-    <b>ESC / P</b><span>pause and save</span>
-  </div>
-  <div id="start-prompt">PRESS ENTER TO START</div>
-  <div id="save-note"></div>
-  <div id="footer">an original open world · three.js · no network</div>
-</div>
-
-<div id="pause" class="screen hidden">
-  <h2>PAUSED</h2>
-  <p>ENTER resume · Q save and quit to the title</p>
-</div>
-
-<div id="wasted" class="screen hidden">
-  <h2>WASTED</h2>
-  <p>ENTER to wake up at the clinic</p>
-</div>
-
-<p id="status" role="status" aria-live="polite"></p>
-<script>
-  // Errors land in #status: a headless run can read them back with --dump-dom.
-  function reportError(message) {
-    const el = document.getElementById('status');
-    if (el) el.textContent = String(message);
-    window.__errors = window.__errors || [];
-    window.__errors.push(String(message));
-  }
-  window.addEventListener('error', (event) => reportError(event.message + ' @ ' + event.filename + ':' + event.lineno));
-  window.addEventListener('unhandledrejection', (event) => reportError('promise: ' + event.reason));
-</script>
-<script src="./vendor/three.min.js"></script>
-<script type="module" src="./src/main.js"></script>
-</body>
+    <!-- The vendored three.js build is a classic script: it puts THREE on the global before the
+         module graph below runs. Everything else is a plain ES module under src/. -->
+    <script src="./vendor/three.min.js"></script>
+    <script>
+      // Boot diagnostics: a failed module shows up in the title, which is what the smoke test reads.
+      window.__bootErrors = [];
+      window.addEventListener('error', (e) => {
+        window.__bootErrors.push(String((e && (e.message || e.error)) || 'error'));
+        document.title = 'BOOT ERROR: ' + (e && e.message ? e.message : 'unknown');
+      });
+      window.addEventListener('unhandledrejection', (e) => {
+        window.__bootErrors.push(String(e.reason));
+        document.title = 'BOOT REJECTION: ' + String(e.reason);
+      });
+    </script>
+    <script type="module">
+      import game from './src/main.js';
+      const note = document.getElementById('boot-note');
+      if (note && game) note.style.display = 'none';
+    </script>
+  </body>
 </html>

@@ -1,251 +1,370 @@
-// The four photographs the entry hands in, staged from the real game: each one places the player,
-// the traffic, the police and the job on the streets, then runs the ordinary simulation for a
-// moment so the frame is a genuine tick of the game rather than a pose. `?shot=city|chase|mission|
-// night` picks one; nothing here is drawn by hand.
+// shots.js — the four staged screenshots.
 //
-// Every scene is built to show more than one system at once: a walk cycle mid-stride on a busy
-// pavement, a cruiser alongside with its bar lit, a job banner over a live marker, and a wet
-// boulevard at midnight. The camera rig is tuned per scene (`player.setRig`), and the last thing each
-// function does is leave the frame exactly as the photograph should find it.
+// Each shot is staged from the real simulation: the same world, the same cars, the same rigs. We place
+// the player, arrange traffic and crowd along the street the camera looks down, set the time of day,
+// then run a fixed number of fixed-size steps with scripted controls and freeze. Nothing reads the
+// wall clock afterwards, so two runs of the same shot render byte-identical frames.
 
-import { roadLine, blockCenter } from './world.js';
-import { HALF, CITY } from './config.js';
+import { CITY, SHOTS, TOD } from './config.js';
+import { RNG, TAU, clamp } from './util.js';
 
-const STEP = 1 / 60;
-const CAR_COLOURS = [0xef5b6b, 0x2fbfa0, 0xf7c04a, 0x4a7bd0, 0xe8e8ec, 0xb46ad8, 0xf08a3c];
-let colourCursor = 0;
-
-/** Put the player on foot at a spot, facing a heading, with the camera already settled. */
-function standAt(api, x, z, yaw, pitch = -0.05) {
-  const { player } = api;
-  player.state.car = null;
-  player.state.x = x;
-  player.state.z = z;
-  player.state.yaw = yaw;
-  player.state.vx = 0;
-  player.state.vz = 0;
-  player.state.health = 100;
-  player.state.alive = true;
-  player.cameraYaw = yaw;
-  player.pitch = pitch;
-  player.group.visible = true;
-  player.group.position.set(x, api.world.groundHeight(x, z), z);
-  player.group.rotation.y = yaw;
-  player.snapCamera();
+function basis(yaw) {
+  return {
+    fx: Math.cos(yaw),
+    fz: -Math.sin(yaw),
+    rx: Math.sin(yaw),
+    rz: Math.cos(yaw),
+  };
 }
 
-/** Put the player behind the wheel of a fresh car, moving, with the camera settled. */
-function driveAt(api, x, z, heading, speed, colour = 0x2fbfa0) {
-  const { player, vehicles } = api;
-  const car = vehicles.addCar({ x, z, heading, colour, driver: 'player', kind: 'coupe' });
-  car.vx = Math.sin(heading) * speed;
-  car.vz = Math.cos(heading) * speed;
-  car.speed = speed;
-  player.state.car = car;
-  player.state.x = x;
-  player.state.z = z;
-  player.state.health = 100;
-  player.state.alive = true;
-  player.state.yawOffset = 0;
-  player.cameraYaw = heading;
-  player.pitch = -0.04;
-  player.group.visible = false;
-  player.snapCamera();
-  return car;
+// Everything the crowd placement needs to know about the street the camera looks along.
+function streetFrame(x, z, yaw) {
+  const b = basis(yaw);
+  const vertical = Math.abs(b.fz) > Math.abs(b.fx); // looking along z
+  const roadIndex = vertical
+    ? Math.round((x - CITY.roadLine(0)) / CITY.pitch)
+    : Math.round((z - CITY.roadLine(0)) / CITY.pitch);
+  const roadCoord = CITY.roadLine(clamp(roadIndex, 0, CITY.blocks));
+  const forwardSign = vertical ? Math.sign(b.fz) || 1 : Math.sign(b.fx) || 1;
+  const along = vertical ? z : x;
+  const rows = [];
+  for (let k = roadIndex; k <= CITY.blocks; k++) {
+    const line = CITY.roadLine(k);
+    const delta = (line - along) * forwardSign;
+    if (delta > -20 && delta < 130) rows.push(k);
+  }
+  if (!rows.length) rows.push(clamp(roadIndex, 0, CITY.blocks - 1));
+  return { vertical, roadIndex, roadCoord, forwardSign, along, rows, ...b };
 }
 
-/** Add one more car to the traffic stream, in a lane of a street. */
-function addTraffic(api, axis, line, along, dir, speed = 9) {
-  const lane = dir * 3.3;
-  const { x, z } = axis === 'x' ? { x: along, z: line + lane } : { x: line + lane, z: along };
-  const heading = axis === 'x' ? (dir > 0 ? Math.PI / 2 : -Math.PI / 2) : (dir > 0 ? 0 : Math.PI);
-  const colour = CAR_COLOURS[colourCursor % CAR_COLOURS.length];
-  colourCursor += 1;
-  const car = api.vehicles.addCar({
-    x, z, heading, colour, driver: 'traffic', axis, dir, line, along, lane,
-  });
-  car.vx = Math.sin(heading) * speed;
-  car.vz = Math.cos(heading) * speed;
-  return car;
+function laneOffset(frame, lateral) {
+  return {
+    x: frame.vertical ? frame.rx * lateral : 0,
+    z: frame.vertical ? frame.rz * lateral : 0,
+  };
 }
 
-/** A car parked at the kerb, for the foreground of a street scene. */
-function parkAt(api, x, z, heading, colour) {
-  return api.vehicles.addCar({ x, z, heading, colour, driver: 'none', kind: 'coupe' });
+function dressTraffic(game, shot, frame) {
+  const rng = new RNG(shot.seed + 17);
+  const cars = game.traffic.cars;
+  const origin = { x: shot.car.x, z: shot.car.z };
+  const b = basis(shot.car.angle);
+
+  // Park the whole fleet out of frame first, then bring back the ones that matter.
+  for (const car of cars) {
+    car.root.visible = false;
+    car.active = false;
+    car.ai = null;
+    car.speed = 0;
+  }
+
+  // Right-hand traffic: keep to the right of the direction of travel.
+  const right = { x: Math.sin(shot.car.angle), z: Math.cos(shot.car.angle) };
+  let index = 0;
+  const place = (alongAhead, lateral, heading, speed, kind) => {
+    if (index >= cars.length) return null;
+    const car = cars[index++];
+    const x = origin.x + frame.fx * alongAhead + right.x * lateral;
+    const z = origin.z + frame.fz * alongAhead + right.z * lateral;
+    car.root.visible = true;
+    car.active = true;
+    car.place(x, z, heading);
+    car.speed = speed;
+    if (kind) car.body.material = car.body.material; // shared material, nothing to do
+    car.ai = {
+      axis: frame.vertical ? 'z' : 'x',
+      dir: Math.sign(frame.vertical ? Math.cos(heading) : Math.cos(heading)) || 1,
+      target: {
+        x: x + Math.cos(heading) * 90,
+        z: z - Math.sin(heading) * 90,
+      },
+      cruise: speed || 10,
+      stuck: 0,
+    };
+    return car;
+  };
+
+  // Same-direction traffic ahead in our lane, staggered.
+  const ahead = [9, 17, 27, 40, 56, 74, 94];
+  for (let i = 0; i < ahead.length; i++) {
+    place(ahead[i], 3.05, shot.car.angle, 8 + (i % 3) * 1.6);
+  }
+  // Oncoming traffic in the other lane.
+  const oncoming = [11, 21, 34, 50, 68, 90];
+  for (let i = 0; i < oncoming.length; i++) {
+    place(oncoming[i], -3.05, shot.car.angle + Math.PI, 9 + (i % 2) * 2);
+  }
+  // Cross traffic crossing the next intersection.
+  const cross = cars[index];
+  if (cross) {
+    const node = frame.rows[1] !== undefined ? frame.rows[1] : frame.roadIndex;
+    const line = CITY.roadLine(node);
+    cross.root.visible = true;
+    cross.active = true;
+    if (frame.vertical) {
+      cross.place(frame.roadCoord - 26, line, 0);
+      cross.ai = { axis: 'x', dir: 1, target: { x: frame.roadCoord + 80, z: line }, cruise: 11, stuck: 0 };
+    } else {
+      cross.place(line, frame.roadCoord - 26, -Math.PI / 2);
+      cross.ai = { axis: 'z', dir: 1, target: { x: line, z: frame.roadCoord + 80 }, cruise: 11, stuck: 0 };
+    }
+    cross.root.visible = true;
+    index++;
+  }
+  return rng;
 }
 
-/** Clear the random kerbside and passing cars that would crop into a staged frame. */
-function clearParkedNear(api, x, z, radius) {
-  for (const car of api.vehicles.cars.slice()) {
-    if (car.driver === 'player' || car.driver === 'police') continue;
-    if (Math.hypot(car.x - x, car.z - z) < radius) api.vehicles.removeCar(car);
+// Put people on the kerbs the camera can see, walking in both directions.
+function dressCrowd(game, shot, frame) {
+  const rng = new RNG(shot.seed + 29);
+  const peds = game.peds.peds;
+  const sideA = frame.vertical
+    ? { column: frame.roadIndex, side: 3 } // +x kerb of the street
+    : { column: frame.roadIndex, side: 2 }; // -z kerb of the street
+  const sideB = frame.vertical
+    ? { column: frame.roadIndex - 1, side: 1 } // -x kerb
+    : { column: frame.roadIndex - 1, side: 0 }; // +z kerb
+
+  const rows = frame.rows.slice(0, 2);
+  let n = 0;
+  for (const row of rows) {
+    for (const side of [sideA, sideB]) {
+      const column = clamp(side.column, 0, CITY.blocks - 1);
+      for (let k = 0; k < 4 && n < peds.length; k++) {
+        const ped = peds[n++];
+        ped.bi = column;
+        ped.bj = clamp(row, 0, CITY.blocks - 1);
+        ped.side = side.side;
+        ped.u = rng.range(-12.5, 12.5);
+        ped.dir = rng.chance(0.5) ? 1 : -1;
+        ped.state = 'walk';
+        ped.pause = 0;
+        ped.cruise = rng.range(1.2, 1.75);
+        ped.speedNow = ped.cruise;
+        ped.phase = rng.range(0, TAU);
+        game.peds.placePed(ped);
+      }
+    }
+  }
+  // Anyone left over goes far from the lens so they cannot clutter it.
+  for (let i = n; i < peds.length; i++) {
+    const ped = peds[i];
+    ped.bi = 0;
+    ped.bj = 0;
+    ped.side = 0;
+    ped.u = clamp(ped.u, -12, 12);
+    game.peds.placePed(ped);
   }
 }
 
-/** Run the real simulation for a while with the keys a player would be holding. */
-function settle(api, seconds) {
-  const steps = Math.max(1, Math.round(seconds / STEP));
-  for (let i = 0; i < steps; i += 1) api.step(STEP);
-}
-
-function resetProgress(api, money, jobs = 0) {
-  api.state.money = money;
-  api.state.completed = jobs > 0 ? ['salt-run'] : [];
-  api.state.jobs = api.state.completed.length;
-  api.state.wanted = 0;
-  api.state.heat = 0;
-  api.state.time = 0;
-  api.police.clear();
-  api.missions.reset();
-  api.hud.setTimer('');
-  api.hud.setObjective('', '');
-}
-
-export function stageShot(name, api) {
-  const { player, vehicles, police, missions, world, input } = api;
-  input.goSimulated();
-  player.setRig(null);
-
-  if (name === 'city') {
-    // The cover: on the pavement of the central avenue, mid-stride, cars running both ways, palms
-    // over the kerb and the towers of downtown closing the view. The camera sits close and low.
-    resetProgress(api, 6980, 1);
-    world.setTimeOfDay(0);
-    world.setWet(0.2);
-    // Just inside the kerb of the block west of the x=0 avenue, looking up it.
-    clearParkedNear(api, -7.9, -56, 34);
-    standAt(api, -7.9, -47, 0.16, -0.07);
-    player.setRig({ distance: 4.3, shoulder: 0.4, lift: 0.06 });
-
-    addTraffic(api, 'z', 0, -22, 1, 11);
-    addTraffic(api, 'z', 0, 6, 1, 12);
-    addTraffic(api, 'z', 0, 34, 1, 10);
-    addTraffic(api, 'z', 0, -2, -1, 10);
-    addTraffic(api, 'z', 0, 26, -1, 11);
-    addTraffic(api, 'z', 0, -30, -1, 9);
-    addTraffic(api, 'x', 0, -33, 1, 9);
-    addTraffic(api, 'x', 0, 18, -1, 9);
-    parkAt(api, -5.4, -62, 0, 0xf7c04a);
-    parkAt(api, 5.4, -38, Math.PI, 0xe8e8ec);
-    parkAt(api, -5.4, 12, 0, 0x4a7bd0);
-    api.pedestrians.focusCrowd(-35, -42, 30);
-
-    // Walk a couple of strides so the legs are caught mid-swing rather than standing to attention.
-    input.setKey('KeyW', true);
-    settle(api, 0.62);
-    api.hud.setObjective('', '');
-    return;
+function parkNeighbours(game, shot, frame) {
+  // Traffic cars that are not in the shot are hidden; the player's own car is placed separately.
+  for (const car of game.traffic.cars) {
+    if (!car.active) {
+      car.root.visible = false;
+      car.speed = 0;
+    }
   }
+}
+
+export function stageShot(game, name) {
+  const shot = SHOTS[name];
+  if (!shot) return false;
+
+  game.setTimeOfDay(shot.tod);
+  game.hud.hideStart();
+  game.started = true;
+  game.paused = false;
+  game.frozen = false;
+
+  const frame = streetFrame(shot.car ? shot.car.x : shot.player.x, shot.car ? shot.car.z : shot.player.z, shot.car ? shot.car.angle : shot.player.angle);
+  dressTraffic(game, shot, frame);
+  dressCrowd(game, shot, frame);
+  if (game.shotName && game.traffic.cars.some((c) => !Number.isFinite(c.x))) game.nanAt = 'traffic-after-dress';
+
+  // The player's car.
+  const car = game.playerCar;
+  car.root.visible = true;
+  car.place(shot.car.x, shot.car.z, shot.car.angle);
+  car.speed = shot.car.speed || 0;
+  if (game.shotName && !Number.isFinite(game.playerCar.x)) game.nanAt = 'car-place';
+
+  const player = game.player;
+  if (shot.onFoot) {
+    player.inCar = null;
+    player.place(shot.player.x, shot.player.z, shot.player.angle);
+    player.root.visible = true;
+    player.cameraYaw = shot.camera.yaw ?? 0;
+    player.aim = 0;
+    game.driveCar = car;
+  } else {
+    player.enterCar(car);
+    player.x = car.x;
+    player.z = car.z;
+    player.y = 0;
+    game.driveCar = car;
+  }
+
+  // Camera: free of the mouse, exactly as configured.
+  game.cameraYaw = shot.car.angle + (shot.camera.yaw || 0);
+  game.mousePitch = shot.camera.pitch || -0.06;
+  game.orbitBias = shot.camera.yaw || 0;
+  game.cameraRig.configure(shot.onFoot ? 'foot' : 'car');
+  game.cameraRig.desiredDistance = shot.camera.distance;
+  game.cameraRig.desiredHeight = shot.camera.height;
+  game.cameraRig.desiredShoulder = shot.onFoot ? 0.55 : 0.0;
+  game.cameraRig.yaw = game.cameraYaw;
+  game.cameraRig.pitch = game.mousePitch;
+  game.cameraRig.update(1, shot.onFoot ? player : car, true);
 
   if (name === 'chase') {
-    // Three stars, a cruiser alongside with the bar lit, another closing from behind, the boulevard
-    // ahead still full of traffic.
-    resetProgress(api, 6180);
-    world.setTimeOfDay(0.06);
-    world.setWet(0.3);
-    const car = driveAt(api, -3.3, -62, 0, 26, 0xef5b6b);
-    api.state.wanted = 3;
-    api.state.heat = 82;
-    police.setWanted(3);
-
-    // Beside and a nose ahead: inside the chase camera's frame, close enough to read the bar.
-    police.spawnAt(1.2, -58.5, 0.06, 27);
-    // Twelve metres back down the lane: the car that started the chase.
-    police.spawnAt(-3.3, -74, 0, 30);
-    // A roadblock forming up the avenue, and one turning in from the cross street.
-    police.spawnAt(3.3, -18, Math.PI, 12);
-    police.spawnAt(roadLine(4) - 3.3, -70, Math.PI / 2, 10);
-
-    addTraffic(api, 'z', 0, -34, 1, 9);
-    addTraffic(api, 'z', 0, 14, 1, 8.5);
-    addTraffic(api, 'z', 0, 40, -1, 9.5);
-    addTraffic(api, 'z', 0, -50, 1, 11);
-    addTraffic(api, 'x', 0, -30, -1, 8);
-    api.pedestrians.focusCrowd(-35, -52, 24);
-
-    api.hud.setObjective('Wanted', 'Three stars — shake them or lose the car');
-    input.setKey('KeyW', true);
-    settle(api, 0.24);
-    input.setKey('KeyW', false);
-    player.state.car = car;
-    api.state.wanted = 3;
-    api.state.heat = 82;
-    // The bar is caught on its red half, at full bloom.
-    police.snapLights('red');
-    api.hud.setWanted(3);
-    return;
+    const cruiser = game.police.stageChase(car.x, car.z, car.yaw + Math.PI * 0.06, 7.6);
+    if (cruiser) {
+      cruiser.flash = 1;
+      // A second cruiser further back, in frame, so the street reads as a pursuit.
+      const extra = game.police.acquireCruiser();
+      if (extra) {
+        extra.place(
+          car.x - Math.cos(car.yaw) * 22 + Math.sin(car.yaw) * 5.2,
+          car.z + Math.sin(car.yaw) * 22 + Math.cos(car.yaw) * 5.2,
+          car.yaw,
+        );
+        extra.speed = 10;
+        extra.active = true;
+        extra.root.visible = true;
+      }
+    }
+    game.police.stars = 3;
+    game.police.rising = 0;
   }
 
   if (name === 'mission') {
-    // The job on the HUD: the Cobalt GT rolling up the avenue with the drop beacon ahead of it.
-    resetProgress(api, 7350);
-    world.setTimeOfDay(0.12);
-    world.setWet(0.2);
-    missions.stage('salt-run');
-
-    const target = { x: roadLine(6), z: roadLine(6) };
-    const gold = vehicles.cars.find((entry) => entry.tag === 'salt-car');
-    clearParkedNear(api, target.x, target.z - 50, 40);
-    standAt(api, target.x - 3.4, target.z - 38, 0, -0.06);
-    if (gold) {
-      gold.x = target.x - 3.4;
-      gold.z = target.z - 44;
-      gold.heading = 0;
-      gold.mesh.position.set(gold.x, 0, gold.z);
-      gold.mesh.rotation.y = 0;
-      gold.vx = 0;
-      gold.vz = 19;
-      gold.speed = 19;
-      player.state.car = gold;
-      player.state.x = gold.x;
-      player.state.z = gold.z;
-      player.cameraYaw = 0;
-      player.pitch = -0.03;
-      player.group.visible = false;
-      player.snapCamera();
-    }
-
-    addTraffic(api, 'x', target.x, target.x - 30, 1, 9);
-    addTraffic(api, 'z', target.x, target.z + 40, -1, 8);
-    addTraffic(api, 'z', target.x, target.z - 34, 1, 10);
-    parkAt(api, target.x + 5.4, target.z - 40, 0, 0x2fbfa0);
-    parkAt(api, target.x - 5.4, target.z + 26, Math.PI, 0xe8e8ec);
-    api.pedestrians.focusCrowd(target.x, target.z - 20, 26);
-
-    api.hud.setObjective('Salt Run', 'Drive the Cobalt GT into the locks.');
-    api.hud.setTimer('DELIVERY 96s');
-    input.setKey('KeyW', true);
-    settle(api, 0.45);
-    input.setKey('KeyW', false);
-    api.hud.setObjective('Salt Run', 'Drive the Cobalt GT into the locks.');
-    api.hud.setTimer('DELIVERY 96s');
-    api.hud.setSpeed(player.state.car ? player.state.car.speed * 3.6 : 0, true);
-    return;
+    game.missions.stage(1, 96);
+    game.hud.setBanner('', 'info', true);
+    game.missions.setMarker(88, -56);
+    game.missions.ring.visible = true;
+    game.police.stars = 0;
+    game.police.rising = 0;
   }
 
-  // night: the boulevard after dark, windows and lamps lit, the asphalt wet enough to carry them.
-  resetProgress(api, 5290, 2);
-  world.setTimeOfDay(1);
-  world.setWet(1);
-  driveAt(api, -3.3, 24, 0, 16, 0xb46ad8);
+  if (name === 'city' || name === 'night') {
+    game.police.clear();
+    game.hud.setBanner('', 'info', true);
+  }
 
-  addTraffic(api, 'z', 0, 58, 1, 9);
-  addTraffic(api, 'z', 0, 88, 1, 10);
-  addTraffic(api, 'z', 0, 2, -1, 10);
-  addTraffic(api, 'z', 0, -30, -1, 9);
-  addTraffic(api, 'x', 0, 30, -1, 8);
-  addTraffic(api, 'x', 0, -22, 1, 9);
-  addTraffic(api, 'z', 0, 40, -1, 9);
-  parkAt(api, -5.4, 44, 0, 0xef5b6b);
-  parkAt(api, -5.4, 56, 0, 0xe8e8ec);
-  parkAt(api, 5.4, 64, Math.PI, 0xf7c04a);
-  parkAt(api, 5.4, 12, Math.PI, 0x2a2f3a);
-  api.pedestrians.focusCrowd(-35, 34, 28);
+  if (shot.hud && shot.hud.banner && name !== 'mission' && name !== 'chase') {
+    game.hud.setBanner(shot.hud.banner, 'job', true);
+  }
 
-  api.hud.setObjective('Night shift', 'The boulevard never closes');
-  api.hud.setTimer('');
-  input.setKey('KeyW', true);
-  settle(api, 0.42);
-  input.setKey('KeyW', false);
-  api.hud.setObjective('Night shift', 'The boulevard never closes');
+  // A short settle: wheels, walk cycles and traffic advance to a lively pose, then the frame is
+  // recomposed so the camera sits exactly where the recipe says, and frozen.
+  const steps = name === 'mission' ? 40 : 32;
+  const controls = {
+    fwd: 0,
+    strafe: 0,
+    run: false,
+    aim: false,
+    firing: false,
+    throttle: name === 'city' || name === 'night' ? 0.3 : 0,
+    brake: 0,
+    steer: 0,
+    handbrake: false,
+  };
+  for (let i = 0; i < steps; i++) {
+    game.simulate(1 / 60, controls);
+  }
+
+  composeShot(game, shot, name);
+
+  game.frozen = true;
+  game.render();
+  return true;
+}
+
+// Put every hero element exactly where the recipe wants it, and snap the camera. Callable twice:
+// once before the settle (so the settle starts from the right pose) and once after (so nothing the
+// simulation did can drift out of frame).
+function composeShot(game, shot, name) {
+  const car = game.playerCar;
+  car.root.visible = true;
+  car.place(shot.car.x, shot.car.z, shot.car.angle);
+  car.speed = shot.car.speed || 0;
+  car.wheelSpin = 2.4;
+  car.updateVisual(1 / 60);
+
+  const player = game.player;
+  if (shot.onFoot) {
+    player.place(shot.player.x, shot.player.z, shot.player.angle);
+    player.root.visible = true;
+    player.cameraYaw = shot.player.angle;
+    player.speed = 0;
+    player.phase = 0.9;
+    player.aim = name === 'mission' ? 1 : 0;
+    player.animate(0, { aim: player.aim > 0.5 });
+  } else {
+    player.inCar = car;
+    player.x = car.x;
+    player.z = car.z;
+    player.y = 0;
+    player.yaw = car.yaw;
+    player.root.visible = false;
+  }
+
+  game.driveCar = car;
+  game.cameraYaw = shot.car.angle + (shot.camera.yaw || 0);
+  game.mousePitch = shot.camera.pitch || -0.06;
+  game.orbitBias = shot.camera.yaw || 0;
+  game.cameraRig.configure(shot.onFoot ? 'foot' : 'car');
+  game.cameraRig.desiredDistance = shot.camera.distance;
+  game.cameraRig.desiredHeight = shot.camera.height;
+  game.cameraRig.desiredShoulder = shot.onFoot ? 0.55 : 0;
+  game.cameraRig.yaw = game.cameraYaw;
+  game.cameraRig.pitch = game.mousePitch;
+  game.cameraRig.initialised = false;
+  game.cameraRig.update(1, shot.onFoot ? player : car, true);
+
+  if (name === 'chase') {
+    // Look back up the avenue: the player's car comes at the lens with the cruiser right behind.
+    game.cameraYaw = car.yaw + Math.PI + 0.2;
+    game.cameraRig.yaw = game.cameraYaw;
+    game.cameraRig.desiredDistance = 12.5;
+    game.cameraRig.desiredHeight = 3.05;
+    game.cameraRig.desiredShoulder = 0;
+    game.cameraRig.initialised = false;
+    game.cameraRig.update(1, car, true);
+
+    const cruiser = game.police.cruisers[0];
+    if (cruiser) {
+      cruiser.active = true;
+      cruiser.root.visible = true;
+      const back = 6.4;
+      const side = -2.8;
+      cruiser.place(
+        car.x - Math.cos(car.yaw) * back + Math.sin(car.yaw) * side,
+        car.z + Math.sin(car.yaw) * back + Math.cos(car.yaw) * side,
+        car.yaw + 0.035,
+      );
+      cruiser.speed = 14;
+      cruiser.flash = 1;
+      cruiser.updateVisual(1 / 60);
+    }
+    // A second cruiser further back and offset, so the street reads as a pursuit.
+    const extra = game.police.cruisers[1];
+    if (extra) {
+      extra.active = true;
+      extra.root.visible = true;
+      extra.place(
+        car.x - Math.cos(car.yaw) * 30 - Math.sin(car.yaw) * 5.6,
+        car.z + Math.sin(car.yaw) * 30 - Math.cos(car.yaw) * 5.6,
+        car.yaw + 0.08,
+      );
+      extra.speed = 14;
+      extra.flash = 0;
+      extra.updateVisual(1 / 60);
+    }
+    game.police.stars = 3;
+    game.police.rising = 0;
+  }
+
+  game.updateHud(0);
 }

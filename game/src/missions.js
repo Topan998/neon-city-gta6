@@ -1,387 +1,412 @@
-// Three jobs and the story that ties them: steal a show car for a fence, wipe out the crew that
-// burned your brother, then outrun the precinct to the marina. Each one has a marker on the street,
-// an objective on the HUD, a timer where it matters and a payout that saves to the browser.
+// missions.js — the three jobs.
 //
-// The walk-up markers pulse, the crew runs at you out of the same physics the rest of the city uses,
-// and the drop marker's beacon is tall enough to steer by from three blocks away.
+//  1. Saltwater Run: take the coupe across town to the docks before the clock runs out.
+//  2. Rival Crew:  drive to the east-side lot and take out four crew members.
+//  3. Three Stars: keep the police on you for ninety seconds without dying.
+//
+// A job gate sits on the sidewalk; walk or drive into it to start. While a job runs the objective
+// marker moves to the target, the HUD shows a timer, and a beam of light plus a waypoint arrow keep
+// the destination readable from anywhere in the city.
 
-import { MISSIONS, CRIME } from './config.js';
-import { roadLine } from './world.js';
-import { buildPersonGeometry } from './pedestrians.js';
-import { makeModelMaterial } from './shape.js';
-import { createRandom } from './random.js';
+import THREE from './three-shim.js';
+import { CITY, MISSIONS, PHYSICS } from './config.js';
+import { TAU, clamp, lerp, damp, smoothstep } from './util.js';
+import { Car } from './vehicles.js';
 
-const DEFINITIONS = [
-  {
-    id: 'salt-run',
-    index: 0,
-    title: 'Salt Run',
-    brief: 'Rico wants the gold Cobalt GT from the pier and a clean drop at the locks.',
-    reward: MISSIONS.rewards[0],
-    start: { x: roadLine(2), z: roadLine(3) },
-    target: { x: roadLine(6), z: roadLine(6) },
-    colour: 0xffd166,
-  },
-  {
-    id: 'cobalt-sweep',
-    index: 1,
-    title: 'Cobalt Sweep',
-    brief: 'The Cobalt Kings hang out on Delmar. Take all five of them off the street.',
-    reward: MISSIONS.rewards[1],
-    start: { x: roadLine(4), z: roadLine(1) },
-    target: { x: roadLine(4), z: roadLine(1) },
-    colour: 0xff5f7e,
-  },
-  {
-    id: 'three-star-exit',
-    index: 2,
-    title: 'Three Star Exit',
-    brief: 'Rattle the precinct, then lose them and reach the marina before the net closes.',
-    reward: MISSIONS.rewards[2],
-    start: { x: roadLine(1), z: roadLine(5) },
-    target: { x: roadLine(7), z: roadLine(2) },
-    colour: 0x5ef2c8,
-  },
+const GATES = [
+  { x: 22, z: 66 },
+  { x: -66, z: -22 },
+  { x: 110, z: 110 },
 ];
 
-export function createMissions(ctx) {
-  const { scene, world, vehicles, player, police, hud, audio, effects, state } = ctx;
-  const random = createRandom(7741);
-  const crewMaterial = makeModelMaterial();
-  const crewGeometry = buildPersonGeometry({ shirt: 0x8d2436, trousers: 0x1f222c, skin: 0xc98d63, hair: 0x120f0d });
+class Rival {
+  constructor(scene, x, z, rng) {
+    this.root = new THREE.Group();
+    this.root.position.set(x, CITY.curb, z);
+    scene.add(this.root);
+    this.x = x;
+    this.z = z;
+    this.health = 100;
+    this.alive = true;
+    this.phase = rng.range(0, TAU);
+    this.cooldown = rng.range(0.5, 2);
 
-  const markers = [];
-  const crew = [];
-  let active = null;
-  let timer = 0;
-  let goldCar = null;
-  let crewLeft = 0;
-  let shownTitle = '';
-  let shownDetail = '';
+    const shirt = new THREE.MeshStandardMaterial({ color: 0x3d1a22, roughness: 0.75 });
+    const skin = new THREE.MeshStandardMaterial({ color: 0xb9835c, roughness: 0.7 });
+    const denim = new THREE.MeshStandardMaterial({ color: 0x24282f, roughness: 0.85 });
 
-  function makeMarker(x, z, colour, label, kind) {
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.62, 0.3), shirt);
+    torso.position.y = 1.16;
+    torso.castShadow = true;
+    this.root.add(torso);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(0.145, 10, 8), skin);
+    head.position.y = 1.62;
+    head.castShadow = true;
+    this.root.add(head);
+    this.legs = [];
+    for (const side of [-1, 1]) {
+      const leg = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.88, 0.18), denim);
+      leg.position.set(side * 0.13, 0.44, 0);
+      leg.castShadow = true;
+      this.root.add(leg);
+      this.legs.push(leg);
+    }
+
+    this.baseX = x;
+    this.baseZ = z;
+    this.yaw = 0;
+  }
+
+  update(dt, player, effects, damage) {
+    if (!this.alive) return;
+    const dx = player.x - this.x;
+    const dz = player.z - this.z;
+    const d = Math.hypot(dx, dz);
+    this.yaw = Math.atan2(-dz, dx);
+    this.root.rotation.y = this.yaw;
+
+    // Hold a loose circle around the lot, shuffling towards the player.
+    let mx = 0;
+    let mz = 0;
+    if (d > 13) {
+      mx = dx / d;
+      mz = dz / d;
+    } else if (d < 7) {
+      mx = -dx / d;
+      mz = -dz / d;
+    } else {
+      mx = -dz / d;
+      mz = dx / d;
+    }
+    const speed = 2.1;
+    this.x += mx * speed * dt;
+    this.z += mz * speed * dt;
+    this.phase += dt * 7;
+    this.legs[0].rotation.x = Math.sin(this.phase) * 0.4;
+    this.legs[1].rotation.x = -Math.sin(this.phase) * 0.4;
+    this.root.position.set(this.x, CITY.curb, this.z);
+
+    this.cooldown -= dt;
+    if (d < 26 && this.cooldown <= 0) {
+      this.cooldown = 1.9;
+      const fx = Math.cos(this.yaw);
+      const fz = -Math.sin(this.yaw);
+      if (effects) effects.muzzle(this.x + fx * 0.5, CITY.curb + 1.25, this.z + fz * 0.5, fx, fz);
+      if (damage) damage(clamp(7 - d * 0.15, 2, 7));
+    }
+  }
+
+  kill(effects) {
+    if (!this.alive) return;
+    this.alive = false;
+    this.root.visible = false;
+    this.root.rotation.z = Math.PI / 2;
+    if (effects) effects.smokePuff(this.x, CITY.curb + 0.6, this.z, 5, 0.9, 0.5);
+  }
+}
+
+export class Missions {
+  constructor(scene, world, rng, effects, audio, police) {
+    this.scene = scene;
+    this.world = world;
+    this.rng = rng;
+    this.effects = effects;
+    this.audio = audio;
+    this.police = police;
+
+    this.index = 0; // next job to hand out
+    this.active = null; // current job object
+    this.completed = new Set();
+    this.failed = 0;
+    this.moneyEarned = 0;
+    this.timeLeft = 0;
+    this.state = 'idle'; // idle | running | done | failed
+    this.banner = null;
+    this.onBanner = null;
+    this.onReward = null;
+    this.rivals = [];
+    this.marker = { x: 0, z: 0, visible: false, radius: 8 };
+    this.clock = 0;
+    this.flash = 0;
+
+    this.buildMarkers();
+    this.setGate(0);
+  }
+
+  buildMarkers() {
     const group = new THREE.Group();
+    this.markerGroup = group;
+    this.scene.add(group);
+
     const ring = new THREE.Mesh(
-      new THREE.TorusGeometry(3.6, 0.16, 8, 42),
-      new THREE.MeshBasicMaterial({ color: colour, transparent: true, opacity: 0.9, toneMapped: false }),
+      new THREE.TorusGeometry(5.6, 0.22, 8, 40),
+      new THREE.MeshStandardMaterial({
+        color: 0xffc24b,
+        emissive: 0xffb43a,
+        emissiveIntensity: 1.6,
+        roughness: 0.4,
+        metalness: 0.3,
+      }),
     );
     ring.rotation.x = -Math.PI / 2;
-    ring.position.y = 0.35;
+    ring.position.y = 0.12;
     group.add(ring);
+    this.ring = ring;
+
     const beam = new THREE.Mesh(
-      new THREE.CylinderGeometry(3.1, 3.1, 42, 20, 1, true),
+      new THREE.CylinderGeometry(4.4, 5.4, 46, 20, 1, true),
       new THREE.MeshBasicMaterial({
-        color: colour, transparent: true, opacity: 0.16, side: THREE.DoubleSide,
-        depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending,
+        color: 0xffc24b,
+        transparent: true,
+        opacity: 0.1,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
       }),
     );
-    beam.position.y = 21;
+    beam.position.y = 23;
     group.add(beam);
-    const core = new THREE.Mesh(
-      new THREE.CylinderGeometry(1.1, 1.1, 42, 12, 1, true),
-      new THREE.MeshBasicMaterial({
-        color: colour, transparent: true, opacity: 0.3, side: THREE.DoubleSide,
-        depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending,
-      }),
+    this.beam = beam;
+
+    // A chevron above the ring, so the marker reads from a distance.
+    const chevron = new THREE.Mesh(
+      new THREE.ConeGeometry(1.8, 2.4, 4),
+      new THREE.MeshStandardMaterial({ color: 0xffd76a, emissive: 0xffb43a, emissiveIntensity: 1.4 }),
     );
-    core.position.y = 21;
-    group.add(core);
-    group.position.set(x, 0, z);
-    group.visible = false;
-    scene.add(group);
-    const marker = { x, z, colour, label, kind, group, ring, beam, active: false };
-    markers.push(marker);
-    return marker;
+    chevron.position.y = 7.2;
+    chevron.rotation.y = Math.PI / 4;
+    group.add(chevron);
+    this.chevron = chevron;
   }
 
-  const startMarkers = DEFINITIONS.map((definition) =>
-    makeMarker(definition.start.x, definition.start.z, definition.colour, definition.title, 'start'),
-  );
-  const targetMarkers = DEFINITIONS.map((definition) =>
-    makeMarker(definition.target.x, definition.target.z, definition.colour, definition.title, 'target'),
-  );
+  setGate(index) {
+    const gate = GATES[clamp(index, 0, GATES.length - 1)];
+    this.marker.x = gate.x;
+    this.marker.z = gate.z;
+    this.marker.visible = true;
+    this.markerGroup.position.set(gate.x, 0, gate.z);
+  }
 
-  /** Refresh which markers the world shows: one per unfinished job, plus the live objective. */
-  function refreshMarkers() {
-    for (const marker of markers) marker.group.visible = false;
-    DEFINITIONS.forEach((definition, index) => {
-      if (state.completed.includes(definition.id)) return;
-      if (active && active.id === definition.id) {
-        targetMarkers[index].group.visible = true;
-      } else if (!active) {
-        startMarkers[index].group.visible = true;
+  setMarker(x, z) {
+    this.marker.x = x;
+    this.marker.z = z;
+    this.marker.visible = true;
+    this.markerGroup.visible = true;
+    this.markerGroup.position.set(x, 0, z);
+  }
+
+  hideMarker() {
+    this.marker.visible = false;
+    this.markerGroup.visible = false;
+  }
+
+  announce(text, tone = 'info') {
+    this.banner = { text, tone, time: 4.2 };
+    if (this.onBanner) this.onBanner(text, tone);
+  }
+
+  start(index = this.index) {
+    if (index >= MISSIONS.length) return false;
+    const def = MISSIONS[index];
+    this.index = index;
+    this.active = {
+      def,
+      index,
+      elapsed: 0,
+      duration: def.duration,
+      target: def.target,
+      phase: 'travel',
+    };
+    this.state = 'running';
+    this.timeLeft = def.duration;
+    this.markerGroup.visible = true;
+    this.announce(`JOB ${index + 1} OF ${MISSIONS.length} — ${def.objective}`, 'job');
+
+    if (def.id === 'crew') {
+      this.spawnRivals(def.target);
+      this.hideMarker();
+      this.setMarker(def.target.x, def.target.z);
+    } else if (def.id === 'delivery') {
+      this.setMarker(def.target.x, def.target.z);
+    } else {
+      this.hideMarker();
+      this.police.setStars(3);
+      this.police.crime(3);
+    }
+
+    if (this.audio) this.audio.chime(true);
+    return true;
+  }
+
+  spawnRivals(target) {
+    for (const r of this.rivals) {
+      if (r.alive) r.kill();
+      this.scene.remove(r.root);
+    }
+    this.rivals = [];
+    const rng = this.rng;
+    for (let i = 0; i < 4; i++) {
+      const a = (i / 4) * TAU + rng.range(-0.3, 0.3);
+      const r = rng.range(5, 11);
+      const x = clamp(target.x + Math.cos(a) * r, -CITY.half + 12, CITY.half - 12);
+      const z = clamp(target.z + Math.sin(a) * r, -CITY.half + 12, CITY.half - 12);
+      const rival = new Rival(this.scene, x, z, rng);
+      this.rivals.push(rival);
+    }
+    // Their car, parked in the middle of the lot.
+    if (!this.rivalCar) {
+      this.rivalCar = new Car(this.scene, this.world, { kind: 'pickup', color: 0x4b1f24 });
+      this.scene.remove(this.rivalCar.root);
+      this.scene.add(this.rivalCar.root);
+    }
+    this.rivalCar.place(target.x + 3, target.z + 3, 0.6);
+    this.rivalCar.root.visible = true;
+  }
+
+  // The player pulled the trigger: work out whether anything in front of them is a rival.
+  onShot(originX, originZ, dirX, dirZ, onKill) {
+    if (!this.active || this.active.def.id !== 'crew') return false;
+    let best = null;
+    let bestD = 34;
+    for (const r of this.rivals) {
+      if (!r.alive) continue;
+      const dx = r.x - originX;
+      const dz = r.z - originZ;
+      const d = Math.hypot(dx, dz);
+      if (d > bestD) continue;
+      const dot = (dx * dirX + dz * dirZ) / (d || 1);
+      if (dot < 0.82) continue;
+      best = r;
+      bestD = d;
+    }
+    if (!best) return false;
+    best.kill(this.effects);
+    if (this.audio) this.audio.thud(0.5);
+    if (onKill) onKill(best);
+    return true;
+  }
+
+  rivalsLeft() {
+    return this.rivals.filter((r) => r.alive).length;
+  }
+
+  // Instant staging for the screenshots: job running, marker ahead, no countdown drift.
+  stage(index, timeLeft) {
+    this.start(index);
+    this.banner = null;
+    if (timeLeft !== undefined) this.timeLeft = timeLeft;
+    if (this.active) this.active.elapsed = this.active.duration - this.timeLeft;
+    // Freeze the countdown pulse for the shot.
+    this.flash = 0;
+  }
+
+  complete() {
+    const job = this.active;
+    if (!job) return;
+    this.state = 'done';
+    this.completed.add(job.def.id);
+    this.moneyEarned += job.def.reward;
+    this.active = null;
+    this.marker.visible = false;
+    this.markerGroup.visible = false;
+    this.announce(`JOB COMPLETE — $${job.def.reward.toLocaleString('en-US')}`, 'good');
+    if (this.onReward) this.onReward(job.def.reward, job.def);
+    if (this.audio) this.audio.chime(true);
+    this.index = Math.min(job.index + 1, MISSIONS.length);
+    for (const r of this.rivals) r.kill();
+    if (this.rivalCar) this.rivalCar.root.visible = false;
+    if (job.def.id === 'survive' && this.police) this.police.setStars(0);
+    if (this.index < MISSIONS.length) {
+      this.setGate(this.index);
+      this.markerGroup.visible = true;
+    }
+  }
+
+  fail(reason) {
+    const job = this.active;
+    if (!job) return;
+    this.state = 'failed';
+    this.failed += 1;
+    this.active = null;
+    this.announce(`JOB FAILED — ${reason}`, 'bad');
+    if (this.audio) this.audio.chime(false);
+    this.setGate(job.index);
+    this.markerGroup.visible = true;
+  }
+
+  update(dt, player, playerCar, onDamage) {
+    this.clock += dt;
+    if (this.banner) {
+      this.banner.time -= dt;
+      if (this.banner.time <= 0) this.banner = null;
+    }
+
+    // Pulse the marker; keep it flat on the ground and slowly turning.
+    if (this.markerGroup.visible) {
+      const pulse = 0.5 + 0.5 * Math.sin(this.clock * 2.2);
+      this.ring.scale.setScalar(1 + pulse * 0.035);
+      this.ring.material.emissiveIntensity = 1.1 + pulse * 1.2;
+      this.chevron.position.y = 7.2 + Math.sin(this.clock * 1.6) * 0.35;
+      this.chevron.rotation.y += dt * 0.7;
+      this.beam.material.opacity = 0.06 + pulse * 0.05;
+    }
+
+    const px = player.inCar ? playerCar.x : player.x;
+    const pz = player.inCar ? playerCar.z : player.z;
+    const distToMarker = Math.hypot(px - this.marker.x, pz - this.marker.z);
+
+    // Idle: stepping into a job gate starts it.
+    if (!this.active) {
+      if (this.state !== 'running' && this.markerGroup.visible && distToMarker < 6.5) {
+        this.start(this.index);
       }
-    });
-  }
-
-  function setObjective(title, detail) {
-    shownTitle = title;
-    shownDetail = detail;
-    hud?.setObjective(title, detail);
-  }
-
-  function playerPosition() {
-    return player.state.car
-      ? { x: player.state.car.x, z: player.state.car.z }
-      : { x: player.state.x, z: player.state.z };
-  }
-
-  function spawnCrew(def) {
-    for (let n = 0; n < MISSIONS.crewCount; n += 1) {
-      const angle = (n / MISSIONS.crewCount) * Math.PI * 2 + 0.4;
-      const x = def.start.x + Math.cos(angle) * 9;
-      const z = def.start.z + Math.sin(angle) * 9;
-      const mesh = new THREE.Mesh(crewGeometry, crewMaterial);
-      mesh.castShadow = true;
-      mesh.position.set(x, 0, z);
-      scene.add(mesh);
-      crew.push({
-        mesh,
-        x,
-        z,
-        heading: angle,
-        health: 60,
-        alive: true,
-        fireCooldown: 0.8 + random() * 0.8,
-        walk: random() * 6,
-      });
-    }
-    crewLeft = crew.length;
-  }
-
-  function clearCrew() {
-    for (const member of crew) scene.remove(member.mesh);
-    crew.length = 0;
-    crewLeft = 0;
-  }
-
-  /** The show car sits on the pier until somebody takes it. */
-  function spawnGoldCar(definition) {
-    if (goldCar) vehicles.removeCar(goldCar);
-    goldCar = vehicles.addCar({
-      x: definition.start.x + 5,
-      z: definition.start.z + 4.5,
-      heading: Math.PI / 2,
-      colour: 0xd9b45a,
-      driver: 'none',
-      kind: 'coupe',
-      boost: 1.22,
-    });
-    goldCar.tag = 'salt-car';
-  }
-
-  function begin(definition) {
-    active = definition;
-    timer = 0;
-    audio.unlock();
-    refreshMarkers();
-
-    if (definition.id === 'salt-run') {
-      spawnGoldCar(definition);
-      setObjective('Salt Run', 'Steal the gold Cobalt GT and drive it to the locks.');
-    } else if (definition.id === 'cobalt-sweep') {
-      spawnCrew(definition);
-      setObjective('Cobalt Sweep', 'Wipe out the Cobalt Kings — 5 left.');
-    } else if (definition.id === 'three-star-exit') {
-      police.setWanted(3);
-      setObjective('Three Star Exit', 'Lose the heat and reach the marina hideout.');
-    }
-    hud?.toast(`${definition.title} — $${definition.reward}`, 'good');
-  }
-
-  function complete(definition) {
-    active = null;
-    timer = 0;
-    if (!state.completed.includes(definition.id)) state.completed.push(definition.id);
-    state.money += definition.reward;
-    state.jobs = state.completed.length;
-    audio.cash();
-    hud?.toast(`${definition.title} complete · +$${definition.reward}`, 'good');
-    hud?.setObjective('', '');
-    clearCrew();
-    if (goldCar) {
-      goldCar.tag = null;
-      goldCar = null;
-    }
-    refreshMarkers();
-    ctx.onMissionDone?.(definition);
-    if (state.completed.length === DEFINITIONS.length) {
-      setTimeout(() => hud?.toast('All three jobs done — the city is yours', 'good'), 1800);
-    }
-  }
-
-  function fail(reason) {
-    active = null;
-    timer = 0;
-    hud?.toast(reason, 'bad');
-    hud?.setObjective('', '');
-    clearCrew();
-    refreshMarkers();
-  }
-
-  function updateCrew(dt) {
-    for (const member of crew) {
-      if (!member.alive) continue;
-      const dx = player.state.x - member.x;
-      const dz = player.state.z - member.z;
-      const distance = Math.hypot(dx, dz);
-      member.heading = Math.atan2(dx, dz);
-      member.fireCooldown -= dt;
-      member.walk += dt * 7;
-
-      if (distance > 15 && distance < 70) {
-        const step = 3.4 * dt;
-        const nx = member.x + Math.sin(member.heading) * step;
-        const nz = member.z + Math.cos(member.heading) * step;
-        const resolved = world.collideCircle(nx, nz, 0.4);
-        member.x = resolved.x;
-        member.z = resolved.z;
-      }
-      member.mesh.position.set(member.x, Math.abs(Math.sin(member.walk)) * 0.04, member.z);
-      member.mesh.rotation.y = member.heading;
-
-      if (distance < 34 && member.fireCooldown <= 0 && state.mode === 'play' && player.state.alive) {
-        member.fireCooldown = 1 + random() * 0.8;
-        effects.tracer({ x: member.x, y: 1.3, z: member.z }, { x: player.state.x, y: 1.2, z: player.state.z }, 0xff9a9a);
-        audio.pistol();
-        if (random() < (distance < 14 ? 0.62 : 0.32)) player.takeDamage(9, state.time);
-      }
-    }
-  }
-
-  function update(dt) {
-    for (const marker of markers) {
-      marker.ring.rotation.z += dt * 0.9;
-      const pulse = 0.75 + Math.sin(state.time * 2.4) * 0.2;
-      marker.ring.material.opacity = pulse;
-    }
-
-    const position = playerPosition();
-
-    if (!active) {
-      DEFINITIONS.forEach((definition, index) => {
-        if (state.completed.includes(definition.id)) return;
-        const marker = startMarkers[index];
-        if (!marker.group.visible) return;
-        if (Math.hypot(position.x - marker.x, position.z - marker.z) < 5) begin(definition);
-      });
       return;
     }
 
-    timer += dt;
+    const job = this.active;
+    job.elapsed += dt;
+    this.timeLeft = Math.max(0, job.duration - job.elapsed);
 
-    if (active.id === 'salt-run') {
-      const inGold = player.state.car === goldCar;
-      if (inGold) {
-        const message = 'Drive the Cobalt GT to the locks.';
-        if (shownDetail !== message) setObjective('Salt Run', message);
-      } else if (shownDetail !== 'Steal the gold Cobalt GT and drive it to the locks.') {
-        setObjective('Salt Run', 'Steal the gold Cobalt GT and drive it to the locks.');
+    if (job.def.id === 'crew') {
+      let damageAccum = 0;
+      for (const r of this.rivals) {
+        if (!r.alive) continue;
+        r.update(dt, player.inCar ? playerCar : player, this.effects, (amount) => {
+          damageAccum += amount;
+        });
       }
-      const target = active.target;
-      if (inGold && Math.hypot(position.x - target.x, position.z - target.z) < 7) {
-        complete(active);
+      if (damageAccum > 0 && player.alive) {
+        player.damage(damageAccum, 'rival');
+        if (this.effects) this.effects.hit(player.inCar ? playerCar.x : player.x, 1.2, player.inCar ? playerCar.z : player.z);
+      }
+      if (this.rivalsLeft() === 0) {
+        this.complete();
         return;
       }
-      const limit = MISSIONS.deliveryTime;
-      hud?.setTimer(`DELIVERY ${Math.max(0, Math.ceil(limit - timer))}s`);
-      if (timer > limit) fail('Too slow — the buyer walked away');
-    } else if (active.id === 'cobalt-sweep') {
-      updateCrew(dt);
-      const left = crew.filter((member) => member.alive).length;
-      crewLeft = left;
-      hud?.setTimer(left > 0 ? `KINGS LEFT ${left}` : '');
-      if (shownDetail !== `Wipe out the Cobalt Kings — ${left} left.` && left > 0) {
-        setObjective('Cobalt Sweep', `Wipe out the Cobalt Kings — ${left} left.`);
-      }
-      if (left === 0) complete(active);
-    } else if (active.id === 'three-star-exit') {
-      const remaining = 90 - timer;
-      hud?.setTimer(`HEAT ON · ${Math.max(0, Math.ceil(remaining))}s`);
-      const target = active.target;
-      if (Math.hypot(position.x - target.x, position.z - target.z) < 8) {
-        complete(active);
+    } else if (job.def.id === 'delivery') {
+      if (distToMarker < 9 && player.inCar) {
+        this.complete();
         return;
       }
-      if (remaining <= 0) fail('The net closed — try again');
-    }
-  }
-
-  /** The player's pistol finds a gang member. */
-  function raycastCrew(origin, direction, maxDistance) {
-    let best = null;
-    let bestDistance = maxDistance;
-    for (const member of crew) {
-      if (!member.alive) continue;
-      for (const height of [0.8, 1.5]) {
-        const ox = member.x - origin.x;
-        const oy = height - origin.y;
-        const oz = member.z - origin.z;
-        const along = ox * direction.x + oy * direction.y + oz * direction.z;
-        if (along < 0.4 || along > bestDistance) continue;
-        const cx = origin.x + direction.x * along;
-        const cy = origin.y + direction.y * along;
-        const cz = origin.z + direction.z * along;
-        if (Math.hypot(cx - member.x, cy - height, cz - member.z) > 0.62) continue;
-        best = { kind: 'crew', target: member, distance: along };
-        bestDistance = along;
+    } else if (job.def.id === 'survive') {
+      if (this.police && this.police.stars < 3) {
+        // Nudge it back up so the job stays a chase.
+        this.police.crime(0.4);
       }
     }
-    return best;
-  }
 
-  function damageCrew(member, amount) {
-    if (!member.alive) return false;
-    member.health -= amount;
-    effects.blood(member.x, 1.2, member.z);
-    if (member.health <= 0) {
-      member.alive = false;
-      member.mesh.rotation.z = Math.PI / 2;
-      member.mesh.position.y = 0.25;
-      audio.cash();
-      hud?.toast('King down · +$120', 'good');
-      state.money += 120;
-      return true;
+    if (this.timeLeft <= 0) {
+      this.fail(job.def.id === 'delivery' ? 'OUT OF TIME' : 'TIME UP');
     }
-    return false;
   }
 
-  function reset() {
-    clearCrew();
-    if (goldCar) {
-      goldCar.tag = null;
-      goldCar = null;
+  statusLine() {
+    if (!this.active) {
+      if (this.index >= MISSIONS.length) return 'ALL JOBS COMPLETE';
+      return `NEXT JOB: ${MISSIONS[this.index].name.toUpperCase()}`;
     }
-    active = null;
-    timer = 0;
-    refreshMarkers();
+    const job = this.active;
+    if (job.def.id === 'crew') return `WIPE OUT THE RIVAL CREW — ${this.rivalsLeft()} LEFT`;
+    return job.def.objective;
   }
-
-  /** The screenshot scenes place a job by hand: same markers, same objective, no walking there. */
-  function stage(id) {
-    const definition = DEFINITIONS.find((entry) => entry.id === id);
-    if (!definition) return;
-    active = definition;
-    timer = 12;
-    refreshMarkers();
-    if (id === 'cobalt-sweep') spawnCrew(definition);
-    if (id === 'salt-run') spawnGoldCar(definition);
-    setObjective(definition.title, definition.brief);
-  }
-
-  refreshMarkers();
-
-  return {
-    markers,
-    crew,
-    update,
-    raycastCrew,
-    damageCrew,
-    reset,
-    stage,
-    refreshMarkers,
-    get active() { return active; },
-    get crewLeft() { return crewLeft; },
-    definitions: DEFINITIONS,
-  };
 }
