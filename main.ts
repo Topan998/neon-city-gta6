@@ -1,29 +1,31 @@
-// Neon City's hand-in, in one Node 22 script (no build step, no install):
+// Neon City's hand-in: one Node 22 script, standard library only, no build and no install.
 //
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
 //
-// It does two things. First it stages the entry — game/ and screenshots/ — into the output
-// directory, starting from an empty one so a file left over from an earlier run can never end up
-// in the hand-in. Then it hands that staged directory to vendor/makefun-game.ts, which walks the
-// files and serializes them into dossier.json: the game's source in import order, plus the
-// screenshots base64'd with their hashes.
+// Two steps. Stage copies game/ and screenshots/ into the output directory (default /output, or
+// whatever MAKEFUN_OUTPUT_DIR says) after deleting the copies an earlier run left there, so the
+// judge never sees a file the repository no longer has. Serialize then hands that staged
+// directory to buildDossier from vendor/makefun-game.ts, which walks it once and writes
+// dossier.json: the game's sources in load order as fenced text, the screenshots as base64 with
+// their sha256.
 //
-// The numbers passed to buildDossier are the gate's own, so this program is as strict as the
-// scorer: a payload the gate would refuse throws here and names the file, instead of leaving a
-// run that looked fine and an entry that gets dropped.
+// The limits below are the gate's own, copied from its gate.json. Passing them to buildDossier
+// makes this program exactly as strict as the scorer: an entry it would refuse throws here, with
+// the offending cap named, instead of shipping quietly and being dropped later.
 
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { buildDossier } from './vendor/makefun-game.ts';
 
-/** Where this file sits: the repository root, the parent of game/ and screenshots/. */
+/** The repository root: this file's own directory, the parent of game/ and screenshots/. */
 const here = fileURLToPath(new URL('.', import.meta.url));
 
-/** The directory the judge reads. The kit sets MAKEFUN_OUTPUT_DIR; /output is the default. */
+/** Where the hand-in lands. The kit exports MAKEFUN_OUTPUT_DIR; /output stands in when it does not. */
 const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
-/** The gate's caps for best-game-01 / gta6-01, copied from its gate.json. */
+/** The gate's caps for gta6-01, verbatim: the bytes one text may take, screenshots and their sizes,
+ *  and how much game/ may hold (files+dirs, bytes, one path's length). */
 const CAPS = {
   text_max_bytes: 163840,
   screenshots: { max: 4, max_bytes: 262144 },
@@ -32,69 +34,71 @@ const CAPS = {
   game_path_max_bytes: 1000,
 } as const;
 
-/** Every regular file under `dir`, with its size, counting subdirectories as we go. */
-function listFiles(dir: string): { path: string; bytes: number }[] {
-  const files: { path: string; bytes: number }[] = [];
+/** One file under a staged directory: its absolute path and its size in bytes. */
+interface Staged {
+  path: string;
+  bytes: number;
+}
+
+/** Every regular file below `dir`, depth first. Directories themselves count as nothing here. */
+function walk(dir: string): Staged[] {
+  const found: Staged[] = [];
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...listFiles(path));
-    else if (entry.isFile()) files.push({ path, bytes: statSync(path).size });
+    if (entry.isDirectory()) found.push(...walk(path));
+    else if (entry.isFile()) found.push({ path, bytes: statSync(path).size });
   }
-  return files;
+  return found;
 }
 
-/** Bytes across a list of files, for the summary line. */
-const totalBytes = (files: { bytes: number }[]): number =>
-  files.reduce((sum, file) => sum + file.bytes, 0);
+/** Sum of sizes, for the one-line totals. */
+const bytesOf = (files: Staged[]): number => files.reduce((n, f) => n + f.bytes, 0);
 
-/** Sizes in KiB, the unit the dossier is quoted in. */
+/** KiB with one decimal, the unit the dossier's own header is quoted in. */
 const kib = (bytes: number): string => `${(bytes / 1024).toFixed(1)} KiB`;
 
+/**
+ * Copy one of the entry's two directories into the output directory, over nothing: an old copy is
+ * removed first. Returns false when the repository has no such directory (screenshots/ is allowed
+ * to be missing here; buildDossier refuses the entry later if it still is).
+ */
+function stage(name: 'game' | 'screenshots'): boolean {
+  const from = join(here, name);
+  if (!existsSync(from)) return false;
+  const to = join(outDir, name);
+  rmSync(to, { recursive: true, force: true });
+  cpSync(from, to, { recursive: true });
+  return true;
+}
+
 mkdirSync(outDir, { recursive: true });
+stage('game');
+stage('screenshots');
 
-// A clean stage: anything the last run left under these two names goes first.
-for (const name of ['game', 'screenshots']) {
-  rmSync(join(outDir, name), { recursive: true, force: true });
-}
-
-// The payload. screenshots/ is optional at the filesystem level; buildDossier insists on it later.
-cpSync(join(here, 'game'), join(outDir, 'game'), { recursive: true });
-if (existsSync(join(here, 'screenshots'))) {
-  cpSync(join(here, 'screenshots'), join(outDir, 'screenshots'), { recursive: true });
-}
-
-// Refuse a screenshot set the scorer would drop, and say which file broke the rule.
+// The screenshots, held to the gate before anything is written: at most four, each under 256 KiB
+// and each a PNG or a JPEG, which buildDossier checks by its first bytes.
 const shotsDir = join(outDir, 'screenshots');
-const shots = existsSync(shotsDir) ? readdirSync(shotsDir) : [];
+const shots = existsSync(shotsDir) ? readdirSync(shotsDir).sort() : [];
 if (shots.length > CAPS.screenshots.max) {
-  throw new Error(
-    `${shots.length} screenshots in ${shotsDir}: the gate takes at most ${CAPS.screenshots.max}`,
-  );
+  throw new Error(`screenshots/: ${shots.length} files, the gate takes ${CAPS.screenshots.max} at most`);
 }
 for (const name of shots) {
   const bytes = statSync(join(shotsDir, name)).size;
   if (bytes > CAPS.screenshots.max_bytes) {
-    throw new Error(
-      `screenshots/${name} is ${bytes} bytes: the gate caps one screenshot at ${CAPS.screenshots.max_bytes}`,
-    );
+    throw new Error(`screenshots/${name}: ${bytes} bytes, one image may be ${CAPS.screenshots.max_bytes}`);
   }
 }
 
-// Build the dossier from the staged copy, not from the source tree: what goes in the file is then
+// The dossier is built from the staged copy, not from the repository, so its bytes describe
 // exactly what the judge is handed.
 const dossier = buildDossier(outDir, CAPS);
 writeFileSync(join(outDir, 'dossier.json'), dossier);
 
-const gameFiles = listFiles(join(outDir, 'game'));
-const shotBytes = shots.reduce((sum, name) => sum + statSync(join(shotsDir, name)).size, 0);
+// A short account of the run: what was copied, how many renders ride along, how big the dossier is.
+const game = walk(join(outDir, 'game'));
+const shotBytes = bytesOf(shots.map((name) => ({ path: join(shotsDir, name), bytes: statSync(join(shotsDir, name)).size })));
 
-// Say what was written, so a run explains itself without anyone having to go and look.
 console.log(`Neon City handed in to ${outDir}`);
-console.log(`  game/         ${gameFiles.length} files, ${totalBytes(gameFiles)} bytes (${kib(totalBytes(gameFiles))})`);
-console.log(`  screenshots/  ${shots.length} images, ${shotBytes} bytes (${kib(shotBytes)})`);
-console.log(`  dossier.json  ${dossier.length} bytes (${kib(dossier.length)})`);
-
-// The game's own files, one per line, so a missing module is visible at a glance.
-for (const file of gameFiles) {
-  console.log(`    game/${file.path.slice(join(outDir, 'game').length + 1)}  ${file.bytes} B`);
-}
+console.log(`  game        ${game.length} files, ${bytesOf(game)} B (${kib(bytesOf(game))})`);
+console.log(`  screenshots ${shots.length} images, ${shotBytes} B (${kib(shotBytes)})`);
+console.log(`  dossier     ${dossier.length} B (${kib(dossier.length)})`);

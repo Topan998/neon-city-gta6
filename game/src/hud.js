@@ -1,523 +1,433 @@
-// hud.js — the interface, drawn with DOM and two small canvases.
+// hud.js — everything drawn on top of the game: the money ticker, the job line, the wanted stars,
+// the condition bar, the speedometer, the minimap canvas, the dialogue and objective banners, the
+// context hint, the pause menu and the title screen.
 //
-// Money, jobs, condition, stars, the minimap, the speedometer, message banners, the waypoint arrow,
-// the pause menu and the start screen. Everything is created once; update() only writes text, classes
-// and canvas pixels, so no DOM is built while the game runs.
+// The markup is built here rather than sitting in index.html, so the page stays a canvas and this
+// file owns the whole overlay. Styling lives in index.html.
 
-import { CITY, HUD as HUDSET, PALETTE } from './config.js';
-import { clamp, lerp } from './util.js';
+const THREE = window.THREE;
 
-const STYLE = `
-#hud, #hud * { box-sizing: border-box; }
-#hud {
-  position: fixed; inset: 0; pointer-events: none; z-index: 10;
-  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
-  font-variant-numeric: tabular-nums;
-  color: #eef1f4; user-select: none;
-}
-#hud .panel {
-  position: absolute; background: rgba(8,11,16,0.55);
-  border: 1px solid rgba(255,255,255,0.12);
-  border-radius: 10px; backdrop-filter: blur(6px);
-  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
-}
-#hud .money {
-  top: 22px; right: 24px; padding: 10px 16px 9px;
-  font-size: 26px; font-weight: 800; letter-spacing: 0.5px;
-  color: #8ff0b4; text-shadow: 0 0 18px rgba(80,255,150,0.35);
-}
-#hud .money small { display:block; font-size: 10px; letter-spacing: 2.4px; color:#8fa0ae; font-weight:600; margin-top:2px; }
-#hud .jobs {
-  top: 22px; right: 24px; margin-top: 76px; padding: 7px 14px;
-  font-size: 12px; letter-spacing: 2.2px; font-weight: 700; color: #cfd8e2;
-}
-#hud .stars {
-  left: 50%; top: 20px; transform: translateX(-50%);
-  padding: 6px 14px; display: flex; gap: 6px; align-items:center;
-  font-size: 20px; color: #3b4450;
-}
-#hud .stars .on { color: #ffd34d; text-shadow: 0 0 16px rgba(255,200,60,0.55); }
-#hud .stars .pulse { animation: hudPulse 0.45s ease-in-out infinite alternate; }
-@keyframes hudPulse { from { opacity: 0.55; transform: scale(0.94); } to { opacity: 1; transform: scale(1.08); } }
-#hud .objective {
-  left: 50%; top: 66px; transform: translateX(-50%);
-  padding: 8px 20px; text-align: center; min-width: 320px;
-}
-#hud .objective .label { font-size: 11px; letter-spacing: 3px; color: #93a3b3; font-weight: 700; }
-#hud .objective .line { font-size: 15px; font-weight: 700; letter-spacing: 1.2px; margin-top: 3px; color: #f3f6f9; }
-#hud .objective .timer { font-size: 13px; letter-spacing: 2px; margin-top: 3px; color: #ffd34d; font-weight: 700; }
-#hud .minimap-wrap { left: 24px; bottom: 24px; padding: 8px; border-radius: 12px; }
-#hud canvas.minimap { display: block; width: 168px; height: 168px; border-radius: 8px; }
-#hud .condition {
-  left: 24px; bottom: 218px; width: 184px; padding: 8px 10px 10px;
-}
-#hud .condition .label { font-size: 10px; letter-spacing: 2.4px; color:#93a3b3; font-weight:700; display:flex; justify-content:space-between; }
-#hud .condition .track { margin-top: 6px; height: 8px; border-radius: 4px; background: rgba(255,255,255,0.12); overflow: hidden; }
-#hud .condition .fill { height: 100%; width: 100%; background: linear-gradient(90deg,#4ce08a,#9bf0b6); transition: width 0.12s linear; }
-#hud .condition .fill.low { background: linear-gradient(90deg,#e85c46,#ff9b7a); }
-#hud .speedo-wrap { right: 24px; bottom: 24px; padding: 6px; border-radius: 14px; }
-#hud canvas.speedo { display: block; width: 156px; height: 156px; }
-#hud .banner {
-  left: 50%; top: 46%; transform: translate(-50%,-50%);
-  padding: 14px 34px; font-size: 21px; letter-spacing: 2.5px; font-weight: 800;
-  background: rgba(8,11,16,0.72); border: 1px solid rgba(255,255,255,0.16);
-  border-radius: 12px; text-align: center; opacity: 0; transition: opacity 0.25s ease;
-  text-shadow: 0 0 22px rgba(120,200,255,0.35); max-width: 68vw;
-}
-#hud .banner.show { opacity: 1; }
-#hud .banner.job { color: #ffd76a; border-color: rgba(255,200,80,0.5); }
-#hud .banner.good { color: #8ff0b4; border-color: rgba(90,240,150,0.5); }
-#hud .banner.bad { color: #ff8f7a; border-color: rgba(255,110,90,0.5); }
-#hud .waypoint {
-  position: absolute; left: 0; top: 0; transform: translate(-50%,-50%);
-  font-size: 11px; font-weight: 800; letter-spacing: 1.4px; color: #ffd76a;
-  padding: 4px 8px; border-radius: 8px; background: rgba(8,11,16,0.6);
-  border: 1px solid rgba(255,200,80,0.45); white-space: nowrap; opacity: 0;
-}
-#hud .waypoint.show { opacity: 1; }
-#hud .hint {
-  left: 50%; bottom: 26px; transform: translateX(-50%);
-  padding: 7px 16px; font-size: 11px; letter-spacing: 2px; color: #b9c6d4; font-weight: 700;
-}
-#hud .mode {
-  left: 24px; top: 22px; padding: 8px 14px; font-size: 11px; letter-spacing: 2.6px;
-  font-weight: 800; color: #cfd8e2;
-}
-#start, #pause {
-  position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center;
-  background: radial-gradient(circle at 50% 45%, rgba(20,32,48,0.72), rgba(4,6,10,0.94));
-  font-family: "Helvetica Neue", Helvetica, Arial, sans-serif; color: #eef2f6;
-  transition: opacity 0.35s ease;
-}
-#start.hidden, #pause.hidden { opacity: 0; pointer-events: none; }
-#start .card, #pause .card { text-align: center; max-width: 760px; padding: 0 24px; }
-#start .kicker { font-size: 12px; letter-spacing: 9px; color: #ff5f8f; font-weight: 800; }
-#start h1 {
-  font-size: 84px; line-height: 0.92; margin: 12px 0 4px; font-weight: 900; letter-spacing: -1px;
-  background: linear-gradient(180deg,#ffffff,#8fb6ff 60%,#ff5f8f);
-  -webkit-background-clip: text; background-clip: text; color: transparent;
-  text-shadow: 0 0 60px rgba(120,170,255,0.25);
-}
-#start h2 { font-size: 17px; letter-spacing: 7px; color: #9fb4c8; font-weight: 700; margin: 0 0 22px; }
-#start .keys { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 6px 30px; font-size: 13px; color: #c8d5e2; margin: 0 auto 24px; max-width: 560px; text-align: left; }
-#start .keys b { color: #ffd76a; font-weight: 800; letter-spacing: 1px; }
-#start .cta { font-size: 14px; letter-spacing: 4px; font-weight: 800; color: #0b0f14; background: linear-gradient(90deg,#8ff0b4,#5fd0ff); display: inline-block; padding: 13px 30px; border-radius: 999px; }
-#start .foot { margin-top: 16px; font-size: 11px; letter-spacing: 2px; color: #7f8f9f; }
-#pause .card h2 { font-size: 34px; letter-spacing: 6px; margin: 0 0 10px; }
-#pause .card p { color: #a9b8c7; font-size: 13px; letter-spacing: 2px; }
-`;
+import { CITY, PLAYER, WANTED } from './config.js';
+import { clamp, lerp, damp, smoothstep } from './util.js';
+import { LINES } from './world.js';
+
+const el = (tag, id, className) => {
+  const node = document.createElement(tag);
+  if (id) node.id = id;
+  if (className) node.className = className;
+  return node;
+};
 
 export class Hud {
-  constructor(root) {
-    this.root = root || document.body;
-    this.money = 0;
-    this.bannerText = '';
-    this.bannerTime = 0;
-    this.bannerSticky = false;
-    this.starsShown = -1;
-    this.paused = false;
-    this.minimapSize = 168;
-    this.speedSize = 156;
-    this.waypointShown = false;
-    this.build();
-  }
+  constructor(game) {
+    this.game = game;
+    this.root = el('div', 'hud');
+    document.body.appendChild(this.root);
 
-  build() {
-    if (!document.getElementById('hud-style')) {
-      const style = document.createElement('style');
-      style.id = 'hud-style';
-      style.textContent = STYLE;
-      document.head.appendChild(style);
+    // ---- money, job, stars ----
+    const cash = el('div', 'cash', 'panel');
+    cash.innerHTML = `
+      <div class="label">Cash</div>
+      <div class="value"><span class="dollars">$0</span><span class="cents">.00</span></div>
+      <div class="job">No job — look for a marker</div>`;
+    this.root.appendChild(cash);
+    this.cashDollars = cash.querySelector('.dollars');
+    this.cashJob = cash.querySelector('.job');
+    this.displayMoney = game.money ?? 0;
+
+    const stars = el('div', 'stars');
+    for (let i = 0; i < 5; i += 1) {
+      const s = el('span', null, null);
+      s.textContent = '★';
+      stars.appendChild(s);
     }
+    this.root.appendChild(stars);
+    this.starNodes = [...stars.children];
+    this.starPulse = 0;
 
-    const hud = document.createElement('div');
-    hud.id = 'hud';
-    hud.innerHTML = `
-      <div class="panel mode" id="hudMode">ON FOOT</div>
-      <div class="panel stars" id="hudStars">
-        <span>★</span><span>★</span><span>★</span><span>★</span><span>★</span>
+    // ---- condition ----
+    const cond = el('div', 'condition', 'panel');
+    cond.innerHTML = `
+      <div class="row"><span class="cond-label">Condition</span><span class="cond-num">100%</span></div>
+      <div class="bar"><i></i></div>`;
+    this.root.appendChild(cond);
+    this.condLabel = cond.querySelector('.cond-label');
+    this.condNum = cond.querySelector('.cond-num');
+    this.condBar = cond.querySelector('.bar');
+    this.condFill = cond.querySelector('.bar i');
+
+    // ---- speedometer ----
+    const speedo = el('div', 'speedo', 'panel');
+    speedo.innerHTML = `<div class="kmh"><span class="num">0</span><small>KM/H</small></div>
+      <div class="gear">GEAR <b>N</b></div>`;
+    this.root.appendChild(speedo);
+    this.speedNum = speedo.querySelector('.num');
+    this.speedoNode = speedo;
+    this.gearNode = speedo.querySelector('.gear b');
+
+    // ---- minimap ----
+    const mapWrap = el('div', 'minimap-wrap', 'panel');
+    const canvas = el('canvas', 'minimap');
+    canvas.width = 352;
+    canvas.height = 352;
+    mapWrap.appendChild(canvas);
+    const ring = el('div', null, 'ring');
+    mapWrap.appendChild(ring);
+    const compass = el('div', null, 'compass');
+    compass.textContent = 'N';
+    mapWrap.appendChild(compass);
+    this.root.appendChild(mapWrap);
+    this.map = canvas;
+    this.mapCtx = canvas.getContext('2d');
+
+    // ---- banners ----
+    const banner = el('div', 'banner');
+    banner.innerHTML = `<div class="who"></div><br><div class="say"></div>`;
+    this.root.appendChild(banner);
+    this.banner = banner;
+    this.bannerWho = banner.querySelector('.who');
+    this.bannerSay = banner.querySelector('.say');
+    this.bannerQueue = [];
+    this.bannerTimer = 0;
+
+    const objective = el('div', 'objective');
+    objective.innerHTML = `<span class="dot"></span><span class="text"></span><span class="clock"></span>`;
+    this.root.appendChild(objective);
+    this.objective = objective;
+    this.objectiveText = objective.querySelector('.text');
+    this.objectiveClock = objective.querySelector('.clock');
+
+    const toast = el('div', 'toast');
+    this.root.appendChild(toast);
+    this.toastNode = toast;
+    this.toastTimer = 0;
+
+    const hint = el('div', 'hint');
+    this.root.appendChild(hint);
+    this.hintNode = hint;
+
+    this.starsCount = 0;
+    this.damageFlash = 0;
+    this.jobText = 'NO JOB — LOOK FOR A MARKER';
+    this.nextJob = null;
+
+    this.buildTitle();
+    this.buildPause();
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Screens
+  // -------------------------------------------------------------------------------------------
+
+  buildTitle() {
+    const start = el('div', 'start');
+    start.innerHTML = `
+      <h1>Neon City</h1>
+      <div class="sub">Saltwater Vice</div>
+      <div class="keys">
+        <div><span>Walk / drive</span><b>W A S D</b></div>
+        <div><span>Look · fire</span><b>MOUSE</b></div>
+        <div><span>Sprint · boost</span><b>SHIFT</b></div>
+        <div><span>Handbrake</span><b>SPACE</b></div>
+        <div><span>Get in / pull out</span><b>E</b></div>
+        <div><span>Get out</span><b>F</b></div>
+        <div><span>Reload</span><b>R</b></div>
+        <div><span>Pause · mute</span><b>ESC · M</b></div>
       </div>
-      <div class="panel objective" id="hudObjective">
-        <div class="label" id="hudJobLabel">JOB 1 OF 3</div>
-        <div class="line" id="hudJobLine">SALTWATER RUN</div>
-        <div class="timer" id="hudTimer">2:30</div>
-      </div>
-      <div class="panel money" id="hudMoney">$0<small>CASH</small></div>
-      <div class="panel jobs" id="hudJobs">JOBS 0 / 3</div>
-      <div class="panel condition" id="hudCondition">
-        <div class="label"><span>CONDITION</span><span id="hudHealth">100</span></div>
-        <div class="track"><div class="fill" id="hudHealthFill"></div></div>
-      </div>
-      <div class="panel minimap-wrap"><canvas class="minimap" id="hudMinimap"></canvas></div>
-      <div class="panel speedo-wrap"><canvas class="speedo" id="hudSpeedo"></canvas></div>
-      <div class="banner" id="hudBanner"></div>
-      <div class="waypoint" id="hudWaypoint"></div>
-      <div class="panel hint" id="hudHint">E · ENTER CAR &nbsp;&nbsp; F · EXIT &nbsp;&nbsp; LEFT CLICK · FIRE</div>
-    `;
-    this.root.appendChild(hud);
-    this.hud = hud;
-
-    this.el = {
-      mode: hud.querySelector('#hudMode'),
-      stars: Array.from(hud.querySelectorAll('#hudStars span')),
-      jobLabel: hud.querySelector('#hudJobLabel'),
-      jobLine: hud.querySelector('#hudJobLine'),
-      timer: hud.querySelector('#hudTimer'),
-      money: hud.querySelector('#hudMoney'),
-      jobs: hud.querySelector('#hudJobs'),
-      health: hud.querySelector('#hudHealth'),
-      healthFill: hud.querySelector('#hudHealthFill'),
-      banner: hud.querySelector('#hudBanner'),
-      waypoint: hud.querySelector('#hudWaypoint'),
-      hint: hud.querySelector('#hudHint'),
-    };
-
-    const map = hud.querySelector('#hudMinimap');
-    map.width = this.minimapSize;
-    map.height = this.minimapSize;
-    this.mapCtx = map.getContext('2d');
-
-    const speedo = hud.querySelector('#hudSpeedo');
-    speedo.width = this.speedSize;
-    speedo.height = this.speedSize;
-    this.speedCtx = speedo.getContext('2d');
-
-    this.startScreen = document.createElement('div');
-    this.startScreen.id = 'start';
-    this.startScreen.innerHTML = `
-      <div class="card">
-        <div class="kicker">MAKE.FUN PRESENTS</div>
-        <h1>NEON CITY</h1>
-        <h2>SALTWATER VICE</h2>
-        <div class="keys">
-          <div><b>W A S D</b> — walk / drive</div>
-          <div><b>SHIFT</b> — run / handbrake</div>
-          <div><b>MOUSE</b> — look, click to fire</div>
-          <div><b>E</b> — enter or hijack a car</div>
-          <div><b>F</b> — step out</div>
-          <div><b>SPACE</b> — brake</div>
-          <div><b>R</b> — reload</div>
-          <div><b>M</b> — mute &nbsp; <b>ESC</b> — pause</div>
-        </div>
-        <div class="cta">CLICK TO START</div>
-        <div class="foot">THREE JOBS · FIVE STARS · ONE CITY</div>
-      </div>
-    `;
-    this.root.appendChild(this.startScreen);
-
-    this.pauseScreen = document.createElement('div');
-    this.pauseScreen.id = 'pause';
-    this.pauseScreen.classList.add('hidden');
-    this.pauseScreen.innerHTML = `
-      <div class="card">
-        <h2>PAUSED</h2>
-        <p>ESC TO RESUME &nbsp;·&nbsp; R TO RESTART THE RUN</p>
-      </div>
-    `;
-    this.root.appendChild(this.pauseScreen);
+      <div class="play">Click to take the city</div>`;
+    document.body.appendChild(start);
+    this.startScreen = start;
   }
 
-  hideStart() {
-    this.startScreen.classList.add('hidden');
+  buildPause() {
+    const pause = el('div', 'pause', 'hidden');
+    pause.innerHTML = `<h2>Paused</h2>
+      <div class="row">Click to go back</div>
+      <div class="row">M · <b>mute</b> &nbsp; F5 · <b>restart</b></div>`;
+    document.body.appendChild(pause);
+    this.pauseScreen = pause;
   }
 
-  showStart() {
-    this.startScreen.classList.remove('hidden');
+  showStart(show) {
+    this.startScreen.classList.toggle('hidden', !show);
   }
 
-  setPaused(paused) {
-    this.paused = paused;
-    this.pauseScreen.classList.toggle('hidden', !paused);
+  showPause(show) {
+    this.pauseScreen.classList.toggle('hidden', !show);
+    this.root.classList.toggle('hidden', show);
   }
 
-  setBanner(text, tone = 'info', sticky = false) {
-    this.bannerText = text || '';
-    this.bannerSticky = sticky;
-    this.bannerTime = sticky ? 9999 : HUDSET.bannerTime;
-    this.el.banner.textContent = this.bannerText;
-    this.el.banner.className = `banner${text ? ' show' : ''}${tone !== 'info' ? ' ' + tone : ''}`;
+  // -------------------------------------------------------------------------------------------
+  // Text bits
+  // -------------------------------------------------------------------------------------------
+
+  /** A banner line: the speaker's name plate plus what they said. Lines queue up. */
+  say(lines) {
+    if (!lines) return;
+    const list = Array.isArray(lines) ? lines : [lines];
+    for (const line of list) {
+      this.bannerQueue.push({
+        who: (line.who ?? '').toUpperCase(),
+        colour: line.colour ?? '#31e6ff',
+        text: line.text ?? '',
+      });
+    }
+    if (this.bannerTimer <= 0) this.nextLine();
   }
 
-  message(text, tone = 'info') {
-    this.setBanner(text, tone, false);
-  }
-
-  setMoney(value) {
-    this.money = value;
-    const formatted = Math.floor(value).toLocaleString('en-US');
-    this.el.money.innerHTML = `$${formatted}<small>CASH</small>`;
-  }
-
-  setStars(count, rising = 0) {
-    if (count === this.starsShown && rising <= 0) {
-      // Still clear the pulse class when the rise settles.
-      for (const s of this.el.stars) s.classList.remove('pulse');
+  nextLine() {
+    const line = this.bannerQueue.shift();
+    if (!line) {
+      this.banner.classList.remove('show');
+      this.bannerTimer = 0;
       return;
     }
-    this.starsShown = count;
-    this.el.stars.forEach((el, i) => {
-      el.classList.toggle('on', i < count);
-      el.classList.toggle('pulse', i < count && rising > 0);
-    });
+    this.bannerWho.textContent = line.who;
+    this.bannerWho.style.background = line.colour ?? '#31e6ff';
+    this.bannerSay.textContent = line.text;
+    this.banner.classList.add('show');
+    this.bannerTimer = clamp(1.6 + line.text.length * 0.032, 1.8, 5.2);
   }
 
-  setHint(text) {
-    this.el.hint.textContent = text;
+  toast(text) {
+    this.toastNode.textContent = text;
+    this.toastNode.classList.add('show');
+    this.toastTimer = 2.2;
   }
 
-  setMode(mode) {
-    this.el.mode.textContent = mode === 'car' ? 'DRIVING' : 'ON FOOT';
-  }
-
-  update(dt, state) {
-    // Banner lifetime.
-    if (!this.bannerSticky && this.bannerTime > 0) {
-      this.bannerTime -= dt;
-      if (this.bannerTime <= 0) {
-        this.el.banner.classList.remove('show');
-        this.bannerText = '';
-      }
+  setObjective(label, time = 0) {
+    if (!label) {
+      this.objective.classList.remove('show');
+      return;
     }
-
-    this.setMoney(state.money);
-    this.setStars(state.stars, state.rising);
-    if (state.mode !== this.modeShown) {
-      this.modeShown = state.mode;
-      this.el.mode.textContent = state.mode === 'car' ? 'DRIVING' : 'ON FOOT';
-      this.setHint(
-        state.mode === 'car'
-          ? 'F · EXIT   SPACE · HAND BRAKE   SHIFT · BOOST'
-          : 'E · ENTER CAR   LEFT CLICK · FIRE   R · RELOAD',
-      );
-    }
-
-    this.el.jobLabel.textContent = `JOB ${clamp(state.jobIndex + 1, 1, 3)} OF 3`;
-    this.el.jobLine.textContent = state.statusLine || '';
-    this.el.timer.textContent = state.timeLeft && state.timeLeft > 0 ? this.formatTime(state.timeLeft) : '';
-    this.el.jobs.textContent = `JOBS ${state.jobsDone} / 3`;
-
-    const hp = clamp(state.health / state.maxHealth, 0, 1);
-    this.el.health.textContent = String(Math.max(0, Math.round(state.health)));
-    this.el.healthFill.style.width = `${hp * 100}%`;
-    this.el.healthFill.classList.toggle('low', hp < 0.35);
-
-    this.drawMinimap(state);
-    this.drawSpeedo(state.speedKmh, state.mode === 'car', state.clip, state.ammo);
-    this.updateWaypoint(state);
+    this.objectiveText.textContent = label;
+    this.objective.classList.add('show');
+    this.objectiveClock.textContent = time > 0 ? this.clock(time) : '';
   }
 
-  formatTime(seconds) {
+  setJob(label) {
+    this.jobText = label;
+    this.cashJob.textContent = label;
+  }
+
+  setNextJob(id) {
+    this.nextJob = id;
+  }
+
+  pulseStars() {
+    this.starPulse = 1;
+  }
+
+  flashDamage() {
+    this.damageFlash = 1;
+  }
+
+  clock(seconds) {
     const s = Math.max(0, Math.ceil(seconds));
     const m = Math.floor(s / 60);
     const r = s % 60;
-    return `${m}:${r < 10 ? '0' : ''}${r}`;
+    return `${m}:${r.toString().padStart(2, '0')}`;
   }
 
-  updateWaypoint(state) {
-    const el = this.el.waypoint;
-    const m = state.marker;
-    if (!m || !m.visible || !state.camera) {
-      el.classList.remove('show');
-      return;
-    }
-    // Project the marker into screen space.
-    const cam = state.camera;
-    const dx = m.x - cam.position.x;
-    const dz = m.z - cam.position.z;
-    const dist = Math.hypot(dx, dz);
-    const forwardX = Math.cos(state.cameraYaw ?? 0);
-    const forwardZ = -Math.sin(state.cameraYaw ?? 0);
-    const dot = (dx * forwardX + dz * forwardZ) / (dist || 1);
+  // -------------------------------------------------------------------------------------------
+  // Per-frame
+  // -------------------------------------------------------------------------------------------
 
-    const w = window.innerWidth;
-    const hgt = window.innerHeight;
-    let sx = w / 2;
-    let sy = hgt * 0.34;
-    // Side of the screen: sign of the cross product.
-    const cross = dx * forwardZ - dz * forwardX;
-    const side = clamp(cross / (dist || 1), -1, 1);
-    if (dot < 0.2) {
-      sx = w / 2 + side * w * 0.32;
-      sy = hgt * 0.62;
-    } else {
-      sx = w / 2 + side * w * 0.2;
-      sy = hgt * 0.3;
+  update(dt) {
+    const game = this.game;
+    const player = game.player;
+    const car = player?.inCar;
+
+    // money ticker: counts towards the real total instead of snapping
+    this.displayMoney = damp(this.displayMoney, game.money, 8, dt);
+    if (Math.abs(this.displayMoney - game.money) < 0.6) this.displayMoney = game.money;
+    this.cashDollars.textContent = `$${Math.round(this.displayMoney).toLocaleString('en-US')}`;
+
+    // stars
+    const stars = game.police?.stars ?? 0;
+    if (stars !== this.starsCount) {
+      this.starsCount = stars;
+      this.starPulse = 1;
     }
-    el.style.left = `${sx}px`;
-    el.style.top = `${sy}px`;
-    el.textContent = `▲ ${m.label || 'OBJECTIVE'} · ${Math.round(dist)} M`;
-    el.classList.add('show');
+    this.starPulse = Math.max(0, this.starPulse - dt * 1.4);
+    for (let i = 0; i < this.starNodes.length; i += 1) {
+      const lit = i < stars;
+      this.starNodes[i].classList.toggle('lit', lit);
+      this.starNodes[i].style.transform = lit ? `scale(${1.06 + this.starPulse * 0.12})` : 'scale(1)';
+    }
+
+    // condition: the car's when driving, the man's on foot
+    const health = car ? car.health : player?.health ?? 100;
+    const pct = clamp(health / 100, 0, 1);
+    this.condFill.style.width = `${pct * 100}%`;
+    this.condBar.classList.toggle('low', pct < 0.4);
+    this.condLabel.textContent = car ? 'Car condition' : 'Vitals';
+    this.condNum.textContent = `${Math.round(pct * 100)}%`;
+
+    // speedometer and gear: only while driving
+    this.speedoNode.style.opacity = car ? '1' : '0';
+    const kph = car ? Math.abs(car.speedKph) : 0;
+    this.speedNum.textContent = Math.round(kph);
+    let gear = 'N';
+    if (car) {
+      if (car.speed < -0.6) gear = 'R';
+      else if (kph < 1) gear = 'N';
+      else if (kph < 26) gear = '1';
+      else if (kph < 52) gear = '2';
+      else if (kph < 84) gear = '3';
+      else if (kph < 118) gear = '4';
+      else gear = '5';
+    }
+    this.gearNode.textContent = gear;
+
+    // banners
+    if (this.bannerTimer > 0) {
+      this.bannerTimer -= dt;
+      if (this.bannerTimer <= 0) this.nextLine();
+    }
+    if (this.toastTimer > 0) {
+      this.toastTimer -= dt;
+      if (this.toastTimer <= 0) this.toastNode.classList.remove('show');
+    }
+
+    // context hint
+    this.updateHint(car);
+
+    this.drawMinimap();
   }
 
-  drawMinimap(state) {
+  /** The two or three keys that matter for what you are doing right now. */
+  updateHint(car) {
+    const game = this.game;
+    let text;
+    if (game.paused) text = '';
+    else if (car) text = '<b>F</b> exit &nbsp; <b>SPACE</b> handbrake &nbsp; <b>SHIFT</b> boost';
+    else if (game.nearestCar && game.nearestCar.dist < 4.6) text = '<b>E</b> enter car &nbsp; <b>LMB</b> fire &nbsp; <b>R</b> reload';
+    else text = '<b>W A S D</b> walk &nbsp; <b>SHIFT</b> run &nbsp; <b>LMB</b> fire &nbsp; <b>E</b> enter car';
+    if (this.hintNode.dataset.text !== text) {
+      this.hintNode.innerHTML = text;
+      this.hintNode.dataset.text = text;
+    }
+  }
+
+  /**
+   * Minimap: the street grid in world space, rotated with the camera? No — north-up, with the
+   * player as an arrow, police as flashing dots, the objective as a diamond and activities as
+   * small squares.
+   */
+  drawMinimap() {
     const ctx = this.mapCtx;
-    const size = this.minimapSize;
-    const scale = size / 230; // metres across the minimap
-    const px = state.player.x;
-    const pz = state.player.z;
-    const cx = size / 2;
-    const cy = size / 2;
+    const size = this.map.width;
+    const half = size / 2;
+    const game = this.game;
+    const player = game.player;
+    if (!player) return;
+    const focus = player.inCar ? player.inCar.pos : player.pos;
+    const range = 132;                      // metres from edge to edge
+    const scale = size / range;
+    const heading = player.inCar ? player.inCar.heading : player.heading;
+    // the map turns with the player: it is easier to read a street you are driving down
+    const rot = -heading;
 
     ctx.save();
     ctx.clearRect(0, 0, size, size);
-    ctx.fillStyle = '#0d1319';
+    ctx.fillStyle = '#0b1016';
     ctx.fillRect(0, 0, size, size);
+    ctx.translate(half, half);
+    ctx.rotate(rot);
+    ctx.scale(scale, scale);
+    ctx.translate(-focus.x, -focus.z);
 
-    // Blocks.
-    ctx.fillStyle = '#1a2430';
-    const plate = (CITY.lot + CITY.walk * 2) * scale;
-    for (let j = 0; j < CITY.blocks; j++) {
-      for (let i = 0; i < CITY.blocks; i++) {
-        const c = CITY.blockCenter(i, j);
-        const x = cx + (c.x - px) * scale - plate / 2;
-        const y = cy + (c.z - pz) * scale - plate / 2;
-        if (x > size || y > size || x + plate < 0 || y + plate < 0) continue;
-        ctx.fillRect(x, y, plate, plate);
+    // blocks
+    ctx.fillStyle = '#1b222b';
+    const block = CITY.blockW;
+    for (let i = 0; i < CITY.blocks; i += 1) {
+      for (let j = 0; j < CITY.blocks; j += 1) {
+        const cx = -CITY.half + CITY.pitch * (i + 0.5);
+        const cz = -CITY.half + CITY.pitch * (j + 0.5);
+        ctx.fillRect(cx - block / 2, cz - block / 2, block, block);
       }
     }
-
-    // Roads: two sets of thin lanes.
-    ctx.strokeStyle = '#2c3a4a';
-    ctx.lineWidth = CITY.road * scale;
-    for (let k = 0; k <= CITY.blocks; k++) {
-      const line = CITY.roadLine(k);
-      const y = cy + (line - pz) * scale;
+    // roads as slightly lighter lines
+    ctx.strokeStyle = '#2e3a47';
+    ctx.lineWidth = CITY.roadW;
+    for (const line of LINES) {
       ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(size, y);
+      ctx.moveTo(line, -CITY.half);
+      ctx.lineTo(line, CITY.half);
       ctx.stroke();
-      const x = cx + (line - px) * scale;
       ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, size);
+      ctx.moveTo(-CITY.half, line);
+      ctx.lineTo(CITY.half, line);
       ctx.stroke();
     }
+    // beach
+    ctx.fillStyle = '#2f2a22';
+    ctx.fillRect(-CITY.half, CITY.beachZ - 10, CITY.half * 2, 90);
 
-    // Traffic dots.
-    if (state.traffic) {
-      ctx.fillStyle = 'rgba(180,196,214,0.55)';
-      for (const c of state.traffic) {
-        const x = cx + (c.x - px) * scale;
-        const y = cy + (c.z - pz) * scale;
-        if (x < 2 || y < 2 || x > size - 2 || y > size - 2) continue;
-        ctx.fillRect(x - 1.5, y - 1.5, 3, 3);
-      }
-    }
-
-    // Police blips, pulsing.
-    if (state.policeCars) {
-      for (const c of state.policeCars) {
-        const x = cx + (c.x - px) * scale;
-        const y = cy + (c.z - pz) * scale;
-        if (x < 4 || y < 4 || x > size - 4 || y > size - 4) continue;
-        ctx.beginPath();
-        ctx.arc(x, y, 4.2, 0, Math.PI * 2);
-        ctx.fillStyle = 'rgba(255,60,60,0.85)';
-        ctx.fill();
-        ctx.beginPath();
-        ctx.arc(x, y, 7.5, 0, Math.PI * 2);
-        ctx.strokeStyle = 'rgba(255,70,70,0.35)';
-        ctx.stroke();
-      }
-    }
-
-    // Objective.
-    if (state.marker && state.marker.visible) {
-      const mx = cx + (state.marker.x - px) * scale;
-      const my = cy + (state.marker.z - pz) * scale;
-      const clampedX = clamp(mx, 8, size - 8);
-      const clampedY = clamp(my, 8, size - 8);
+    // the objective
+    const wp = game.missions?.waypoint;
+    if (wp) {
       ctx.save();
-      ctx.translate(clampedX, clampedY);
-      ctx.rotate(Math.PI / 4);
-      ctx.fillStyle = '#ffd34d';
-      ctx.fillRect(-4.5, -4.5, 9, 9);
-      ctx.strokeStyle = 'rgba(255,220,120,0.6)';
-      ctx.strokeRect(-7, -7, 14, 14);
+      ctx.translate(wp.x, wp.z);
+      ctx.rotate(-rot);
+      ctx.fillStyle = wp.job ? '#ffd45e' : '#ff3d81';
+      ctx.beginPath();
+      ctx.moveTo(0, -7);
+      ctx.lineTo(7, 0);
+      ctx.lineTo(0, 7);
+      ctx.lineTo(-7, 0);
+      ctx.closePath();
+      ctx.fill();
       ctx.restore();
     }
 
-    // Player arrow.
-    ctx.save();
-    ctx.translate(cx, cy);
-    ctx.rotate(-state.player.yaw + Math.PI / 2);
-    ctx.beginPath();
-    ctx.moveTo(0, -7);
-    ctx.lineTo(5.2, 5.4);
-    ctx.lineTo(0, 2.6);
-    ctx.lineTo(-5.2, 5.4);
-    ctx.closePath();
-    ctx.fillStyle = '#f4f8ff';
-    ctx.fill();
-    ctx.strokeStyle = 'rgba(120,190,255,0.9)';
-    ctx.lineWidth = 1.2;
-    ctx.stroke();
-    ctx.restore();
-
-    // Frame and north tick.
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-    ctx.lineWidth = 1;
-    ctx.strokeRect(0.5, 0.5, size - 1, size - 1);
-    ctx.fillStyle = 'rgba(255,255,255,0.5)';
-    ctx.font = 'bold 9px Helvetica, Arial, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('N', cx, 11);
-    ctx.restore();
-  }
-
-  drawSpeedo(kmh, driving, clip, ammo) {
-    const ctx = this.speedCtx;
-    const s = this.speedSize;
-    const c = s / 2;
-    const r = c - 12;
-    ctx.clearRect(0, 0, s, s);
-
-    const start = Math.PI * 0.75;
-    const end = Math.PI * 2.25;
-    const maxKmh = 180;
-
-    ctx.beginPath();
-    ctx.arc(c, c, r, start, end);
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)';
-    ctx.lineWidth = 7;
-    ctx.stroke();
-
-    const t = clamp(kmh / maxKmh, 0, 1);
-    ctx.beginPath();
-    ctx.arc(c, c, r, start, start + (end - start) * t);
-    const grad = ctx.createLinearGradient(0, 0, s, s);
-    grad.addColorStop(0, '#5fd0ff');
-    grad.addColorStop(1, '#ff5f8f');
-    ctx.strokeStyle = grad;
-    ctx.lineWidth = 7;
-    ctx.lineCap = 'round';
-    ctx.stroke();
-    ctx.lineCap = 'butt';
-
-    // Ticks.
-    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-    ctx.lineWidth = 1.5;
-    for (let i = 0; i <= 9; i++) {
-      const a = start + ((end - start) * i) / 9;
-      const x1 = c + Math.cos(a) * (r - 10);
-      const y1 = c + Math.sin(a) * (r - 10);
-      const x2 = c + Math.cos(a) * (r - 16);
-      const y2 = c + Math.sin(a) * (r - 16);
-      ctx.beginPath();
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
+    // activities
+    for (const blip of game.activities?.blips ?? []) {
+      ctx.save();
+      ctx.translate(blip.x, blip.z);
+      ctx.rotate(-rot);
+      ctx.fillStyle = blip.colour;
+      ctx.globalAlpha = 0.9;
+      ctx.fillRect(-3.5, -3.5, 7, 7);
+      ctx.restore();
     }
 
-    ctx.textAlign = 'center';
-    ctx.fillStyle = '#f2f6fa';
-    ctx.font = 'bold 34px Helvetica, Arial, sans-serif';
-    ctx.fillText(String(Math.round(kmh)), c, c + 6);
-    ctx.fillStyle = 'rgba(190,205,220,0.8)';
-    ctx.font = 'bold 9px Helvetica, Arial, sans-serif';
-    ctx.fillText(driving ? 'KM/H' : 'ON FOOT', c, c + 24);
-    ctx.fillStyle = 'rgba(255,255,255,0.55)';
-    ctx.font = 'bold 10px Helvetica, Arial, sans-serif';
-    ctx.fillText(driving ? 'GEAR D' : `AMMO ${clip}/${ammo}`, c, c + 44);
+    // police
+    for (const c of game.police?.cruisers ?? []) {
+      const blink = Math.sin(game.time * 12 + c.car.pos.x) > 0;
+      ctx.fillStyle = blink ? '#ff2233' : '#2b6bff';
+      ctx.beginPath();
+      ctx.arc(c.car.pos.x, c.car.pos.z, 4.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // the player: an arrow at the centre, always pointing up
+    ctx.save();
+    ctx.translate(focus.x, focus.z);
+    ctx.rotate(-rot);
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(0, -8);
+    ctx.lineTo(6, 7);
+    ctx.lineTo(0, 4);
+    ctx.lineTo(-6, 7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.restore();
+
+    // vignette and border
+    const grd = ctx.createRadialGradient(half, half, size * 0.2, half, half, size * 0.5);
+    grd.addColorStop(0, 'rgba(0,0,0,0)');
+    grd.addColorStop(1, 'rgba(0,0,0,0.55)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, size, size);
+
+    if (this.damageFlash > 0) {
+      this.damageFlash = Math.max(0, this.damageFlash - 0.03);
+      ctx.fillStyle = `rgba(180,20,20,${this.damageFlash * 0.18})`;
+      ctx.fillRect(0, 0, size, size);
+    }
   }
 }

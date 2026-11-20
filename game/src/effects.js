@@ -1,248 +1,326 @@
-// effects.js — muzzle flashes, impact sparks, tyre smoke, hit puffs and screen shake.
-//
-// Two pooled THREE.Points systems (hot sparks and soft smoke) plus a single reusable flash card. Pools
-// are fixed at construction, so nothing allocates while the game runs; the RNG is seeded so a staged
-// screenshot can fire the same sparks every time.
+// effects.js — the flourishes: muzzle flashes, tracers, impact sparks, blood, tyre smoke, dust and
+// the rain system behind ?rain=1. Everything is pooled — a burst reuses a particle slot rather than
+// allocating, so a firefight never triggers a garbage collection.
 
-import THREE from './three-shim.js';
-import { RNG, clamp, TAU, radialTexture } from './util.js';
+const THREE = window.THREE;
 
-const MAX_SPARKS = 260;
-const MAX_SMOKE = 180;
+import { TAU, clamp, lerp, randRange, mulberry32, TEX, textureFrom, canvas2d } from './util.js';
 
-function softTexture(inner, outer) {
-  return radialTexture(64, inner, outer);
+const MAX_PARTICLES = 900;
+const MAX_TRACERS = 14;
+
+/** A soft vertical streak for rain: a thin bright line that fades at both ends. */
+function rainStreakTexture() {
+  const { canvas, ctx } = canvas2d(8, 64);
+  const g = ctx.createLinearGradient(0, 0, 0, 64);
+  g.addColorStop(0, 'rgba(200,226,255,0)');
+  g.addColorStop(0.4, 'rgba(200,226,255,0.75)');
+  g.addColorStop(1, 'rgba(200,226,255,0.05)');
+  ctx.fillStyle = g;
+  ctx.fillRect(3, 0, 2, 64);
+  return textureFrom(canvas, { repeat: 1 });
 }
 
 export class Effects {
-  constructor(scene, camera, rng) {
-    this.scene = scene;
-    this.camera = camera;
-    this.rng = rng || new RNG(99);
+  constructor(game) {
+    this.game = game;
+    this.scene = game.scene;
+    this.rng = mulberry32(0x9911ee);
+    this.shakeAmount = 0;
+    this.flashTimer = 0;
+    this.buildParticles();
+    this.buildTracers();
+    this.buildMuzzle();
+    this.buildRain();
+  }
 
-    // Sparks: additive points, warm, short lived.
-    const sparkGeo = new THREE.BufferGeometry();
-    this.sparkPos = new Float32Array(MAX_SPARKS * 3);
-    this.sparkCol = new Float32Array(MAX_SPARKS * 3);
-    for (let i = 0; i < MAX_SPARKS; i++) this.sparkPos[i * 3 + 1] = -999;
-    sparkGeo.setAttribute('position', new THREE.BufferAttribute(this.sparkPos, 3));
-    sparkGeo.setAttribute('color', new THREE.BufferAttribute(this.sparkCol, 3));
-    const sparkMat = new THREE.PointsMaterial({
-      size: 0.22,
-      map: softTexture('rgba(255,255,255,1)', 'rgba(255,180,80,0)'),
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      vertexColors: true,
+  buildParticles() {
+    const positions = new Float32Array(MAX_PARTICLES * 3);
+    const colours = new Float32Array(MAX_PARTICLES * 3);
+    const sizes = new Float32Array(MAX_PARTICLES);
+    for (let i = 0; i < MAX_PARTICLES; i += 1) {
+      positions[i * 3 + 1] = -50;
+      sizes[i] = 0.4;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(colours, 3));
+    geo.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+    const mat = new THREE.PointsMaterial({
+      map: TEX.glow(),
+      size: 0.5,
       sizeAttenuation: true,
+      transparent: true,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      vertexColors: true,
+      toneMapped: false,
       opacity: 0.95,
     });
-    this.sparks = new THREE.Points(sparkGeo, sparkMat);
-    this.sparks.frustumCulled = false;
-    scene.add(this.sparks);
-    this.sparkState = [];
-    for (let i = 0; i < MAX_SPARKS; i++) {
-      this.sparkState.push({ life: 0, vx: 0, vy: 0, vz: 0, grav: 1 });
+    // per-point size: patch the shader so each particle can have its own scale
+    mat.onBeforeCompile = (shader) => {
+      shader.vertexShader = shader.vertexShader
+        .replace('attribute float size;', '')
+        .replace('uniform float size;', '')
+        .replace('void main() {', 'attribute float size;\nvoid main() {')
+        .replace('gl_PointSize = size;', 'gl_PointSize = size;');
+    };
+    this.points = new THREE.Points(geo, mat);
+    this.points.frustumCulled = false;
+    this.scene.add(this.points);
+    this.particles = [];
+    for (let i = 0; i < MAX_PARTICLES; i += 1) {
+      this.particles.push({ life: 0, max: 1, vx: 0, vy: 0, vz: 0, x: 0, y: -50, z: 0, size: 0.5, drag: 2, gravity: -9 });
     }
-    this.sparkCursor = 0;
+    this.cursor = 0;
+  }
 
-    // Smoke / dust: soft alpha points that rise and fade.
-    const smokeGeo = new THREE.BufferGeometry();
-    this.smokePos = new Float32Array(MAX_SMOKE * 3);
-    this.smokeCol = new Float32Array(MAX_SMOKE * 3);
-    for (let i = 0; i < MAX_SMOKE; i++) this.smokePos[i * 3 + 1] = -999;
-    smokeGeo.setAttribute('position', new THREE.BufferAttribute(this.smokePos, 3));
-    smokeGeo.setAttribute('color', new THREE.BufferAttribute(this.smokeCol, 3));
-    const smokeMat = new THREE.PointsMaterial({
-      size: 1.6,
-      map: softTexture('rgba(255,255,255,0.55)', 'rgba(255,255,255,0)'),
-      transparent: true,
-      depthWrite: false,
-      vertexColors: true,
-      sizeAttenuation: true,
-      opacity: 0.55,
+  buildTracers() {
+    this.tracers = [];
+    const geo = new THREE.BoxGeometry(0.04, 0.04, 1);
+    for (let i = 0; i < MAX_TRACERS; i += 1) {
+      const mat = new THREE.MeshBasicMaterial({
+        color: 0xffe6a8, transparent: true, opacity: 0, blending: THREE.AdditiveBlending,
+        depthWrite: false, toneMapped: false,
+      });
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.visible = false;
+      mesh.frustumCulled = false;
+      this.scene.add(mesh);
+      this.tracers.push({ mesh, life: 0 });
+    }
+    this.tracerCursor = 0;
+  }
+
+  buildMuzzle() {
+    const geo = new THREE.PlaneGeometry(1.1, 1.1);
+    const mat = new THREE.MeshBasicMaterial({
+      map: TEX.glow(), color: 0xffd9a0, transparent: true, opacity: 0.9,
+      blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false,
     });
-    this.smoke = new THREE.Points(smokeGeo, smokeMat);
-    this.smoke.frustumCulled = false;
-    scene.add(this.smoke);
-    this.smokeState = [];
-    for (let i = 0; i < MAX_SMOKE; i++) this.smokeState.push({ life: 0, vx: 0, vy: 0, vz: 0 });
-    this.smokeCursor = 0;
-
-    // Muzzle flash: one small additive card that follows the camera.
-    const flashTex = softTexture('rgba(255,255,240,1)', 'rgba(255,170,60,0)');
-    this.flash = new THREE.Sprite(
-      new THREE.SpriteMaterial({
-        map: flashTex,
-        color: 0xffe6b0,
-        blending: THREE.AdditiveBlending,
-        transparent: true,
-        depthWrite: false,
-        opacity: 0,
-      }),
-    );
-    this.flash.scale.set(1.6, 1.6, 1);
-    scene.add(this.flash);
-    this.flashLife = 0;
-
-    this.shake = 0;
-    this.tyreAccum = 0;
+    this.muzzle = new THREE.Mesh(geo, mat);
+    this.muzzle.visible = false;
+    this.scene.add(this.muzzle);
+    this.muzzleLife = 0;
   }
 
-  spark(x, y, z, n = 8, power = 1) {
-    for (let i = 0; i < n; i++) {
-      const idx = this.sparkCursor;
-      this.sparkCursor = (this.sparkCursor + 1) % MAX_SPARKS;
-      const st = this.sparkState[idx];
-      st.life = this.rng.range(0.25, 0.7);
-      st.maxLife = st.life;
-      st.vx = this.rng.range(-1, 1) * 5 * power;
-      st.vy = this.rng.range(0.4, 1.6) * 5 * power;
-      st.vz = this.rng.range(-1, 1) * 5 * power;
-      st.grav = 1;
-      this.sparkPos[idx * 3] = x;
-      this.sparkPos[idx * 3 + 1] = y;
-      this.sparkPos[idx * 3 + 2] = z;
-      const warm = this.rng.range(0.6, 1);
-      this.sparkCol[idx * 3] = 1;
-      this.sparkCol[idx * 3 + 1] = 0.55 + warm * 0.4;
-      this.sparkCol[idx * 3 + 2] = 0.2 + warm * 0.3;
+  buildRain() {
+    const count = 2600;
+    const positions = new Float32Array(count * 6);
+    const rng = this.rng;
+    this.rainVel = new Float32Array(count);
+    this.rainCount = count;
+    for (let i = 0; i < count; i += 1) {
+      const x = randRange(rng, -60, 60);
+      const y = randRange(rng, 0, 42);
+      const z = randRange(rng, -60, 60);
+      const len = randRange(rng, 0.5, 1.3);
+      positions[i * 6] = x;
+      positions[i * 6 + 1] = y;
+      positions[i * 6 + 2] = z;
+      positions[i * 6 + 3] = x + 0.06;
+      positions[i * 6 + 4] = y - len;
+      positions[i * 6 + 5] = z;
+      this.rainVel[i] = randRange(rng, 26, 42);
     }
-    this.sparks.geometry.attributes.position.needsUpdate = true;
-    this.sparks.geometry.attributes.color.needsUpdate = true;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.LineBasicMaterial({
+      color: 0xbcd6f0, transparent: true, opacity: 0.5, blending: THREE.AdditiveBlending,
+      depthWrite: false, toneMapped: false,
+    });
+    this.rain = new THREE.LineSegments(geo, mat);
+    this.rain.frustumCulled = false;
+    this.rain.visible = false;
+    this.scene.add(this.rain);
+    this.rainEnabled = false;
   }
 
-  smokePuff(x, y, z, n = 3, spread = 0.5, tone = 0.72) {
-    for (let i = 0; i < n; i++) {
-      const idx = this.smokeCursor;
-      this.smokeCursor = (this.smokeCursor + 1) % MAX_SMOKE;
-      const st = this.smokeState[idx];
-      st.life = this.rng.range(0.7, 1.8);
-      st.maxLife = st.life;
-      st.vx = this.rng.range(-1, 1) * spread;
-      st.vy = this.rng.range(0.25, 0.9);
-      st.vz = this.rng.range(-1, 1) * spread;
-      this.smokePos[idx * 3] = x + this.rng.range(-0.35, 0.35);
-      this.smokePos[idx * 3 + 1] = y + this.rng.range(0, 0.3);
-      this.smokePos[idx * 3 + 2] = z + this.rng.range(-0.35, 0.35);
-      this.smokeCol[idx * 3] = tone;
-      this.smokeCol[idx * 3 + 1] = tone;
-      this.smokeCol[idx * 3 + 2] = tone * 1.02;
-    }
-    this.smoke.geometry.attributes.position.needsUpdate = true;
-    this.smoke.geometry.attributes.color.needsUpdate = true;
+  setRain(on) {
+    this.rainEnabled = on;
+    this.rain.visible = on;
   }
 
-  muzzle(x, y, z, dx, dz) {
-    this.flash.position.set(x + dx * 0.4, y, z + dz * 0.4);
-    this.flashLife = 0.055;
-    this.flash.material.opacity = 0.95;
-    this.flash.scale.setScalar(this.rng.range(1.3, 1.9));
-    this.spark(x, y, z, 4, 0.7);
+  /** Grab a particle slot: the oldest one if we are full. */
+  spawn(x, y, z, opts) {
+    const p = this.particles[this.cursor];
+    this.cursor = (this.cursor + 1) % MAX_PARTICLES;
+    p.x = x;
+    p.y = y;
+    p.z = z;
+    p.vx = opts.vx ?? 0;
+    p.vy = opts.vy ?? 0;
+    p.vz = opts.vz ?? 0;
+    p.life = opts.life ?? 0.5;
+    p.max = p.life;
+    p.size = opts.size ?? 0.35;
+    p.drag = opts.drag ?? 3;
+    p.gravity = opts.gravity ?? -9;
+    p.r = opts.r ?? 1;
+    p.g = opts.g ?? 1;
+    p.b = opts.b ?? 1;
+    return p;
   }
 
-  hit(x, y, z) {
-    this.smokePuff(x, y, z, 3, 0.7, 0.55);
-    this.spark(x, y, z, 3, 0.4);
-  }
-
-  dust(x, y, z, power = 1) {
-    this.smokePuff(x, y, z, 1, 0.35, 0.62);
-  }
-
-  tyre(x, y, z, intensity = 1) {
-    this.tyreAccum += intensity;
-    if (this.tyreAccum > 0.6) {
-      this.tyreAccum = 0;
-      this.smokePuff(x, y, z, 1, 0.5, 0.66);
+  muzzleFlash(position, quaternion) {
+    this.muzzle.visible = true;
+    this.muzzle.position.copy(position);
+    if (quaternion) this.muzzle.quaternion.copy(quaternion);
+    this.muzzle.scale.setScalar(randRange(this.rng, 0.8, 1.3));
+    this.muzzleLife = 0.06;
+    for (let i = 0; i < 5; i += 1) {
+      this.spawn(position.x, position.y, position.z, {
+        vx: randRange(this.rng, -2, 2), vy: randRange(this.rng, -0.5, 2), vz: randRange(this.rng, -2, 2),
+        life: 0.12, size: 0.3, r: 1, g: 0.8, b: 0.45, gravity: 0, drag: 6,
+      });
     }
   }
 
-  tyreSmoke(car, dt) {
-    if (Math.abs(car.lateral) < 1.6 && !car.handbrake) return;
-    if (Math.abs(car.speed) < 3) return;
-    const backX = car.x - car.forwardX * 1.4;
-    const backZ = car.z - car.forwardZ * 1.4;
-    const rx = car.rightX * 0.85;
-    const rz = car.rightZ * 0.85;
-    this.tyre(backX + rx, 0.15, backZ + rz, 1);
-    this.tyre(backX - rx, 0.15, backZ - rz, 1);
+  tracer(from, to, colour = 0xffe6a8) {
+    const slot = this.tracers[this.tracerCursor];
+    this.tracerCursor = (this.tracerCursor + 1) % MAX_TRACERS;
+    const mesh = slot.mesh;
+    const len = from.distanceTo(to);
+    mesh.visible = true;
+    mesh.material.color.setHex(colour);
+    mesh.material.opacity = 0.85;
+    mesh.position.copy(from).add(to).multiplyScalar(0.5);
+    mesh.lookAt(to);
+    mesh.scale.set(1, 1, len);
+    slot.life = 0.06;
+  }
+
+  sparks(x, y, z, count = 8, colour = 0xffb04a) {
+    const c = new THREE.Color(colour);
+    for (let i = 0; i < count; i += 1) {
+      this.spawn(x, y, z, {
+        vx: randRange(this.rng, -5, 5),
+        vy: randRange(this.rng, 1.5, 6.5),
+        vz: randRange(this.rng, -5, 5),
+        life: randRange(this.rng, 0.25, 0.6),
+        size: randRange(this.rng, 0.1, 0.22),
+        r: c.r, g: c.g, b: c.b, gravity: -14, drag: 1.2,
+      });
+    }
+  }
+
+  blood(x, y, z) {
+    for (let i = 0; i < 12; i += 1) {
+      this.spawn(x, y, z, {
+        vx: randRange(this.rng, -2.4, 2.4),
+        vy: randRange(this.rng, 0.5, 3.4),
+        vz: randRange(this.rng, -2.4, 2.4),
+        life: randRange(this.rng, 0.3, 0.8),
+        size: randRange(this.rng, 0.12, 0.3),
+        r: 0.42, g: 0.03, b: 0.05, gravity: -11, drag: 2,
+      });
+    }
+  }
+
+  dust(x, y, z) {
+    if (this.rng() > 0.5) return;
+    this.spawn(x, y + 0.05, z, {
+      vx: randRange(this.rng, -0.6, 0.6),
+      vy: randRange(this.rng, 0.2, 1),
+      vz: randRange(this.rng, -0.6, 0.6),
+      life: randRange(this.rng, 0.25, 0.5),
+      size: randRange(this.rng, 0.2, 0.4),
+      r: 0.5, g: 0.48, b: 0.45, gravity: -0.6, drag: 3,
+    });
+  }
+
+  tyreSmoke(x, y, z, strength = 1) {
+    for (let i = 0; i < 3; i += 1) {
+      this.spawn(x + randRange(this.rng, -0.4, 0.4), y + 0.1, z + randRange(this.rng, -0.4, 0.4), {
+        vx: randRange(this.rng, -1.6, 1.6) * strength,
+        vy: randRange(this.rng, 0.3, 1.6),
+        vz: randRange(this.rng, -1.6, 1.6) * strength,
+        life: randRange(this.rng, 0.5, 1.2),
+        size: randRange(this.rng, 0.4, 0.9) * strength,
+        r: 0.62, g: 0.62, b: 0.64, gravity: 0.4, drag: 1.4,
+      });
+    }
+  }
+
+  shake(amount) {
+    const player = this.game.player;
+    if (player) player.shake = Math.min(1.2, player.shake + amount);
   }
 
   update(dt) {
-    // Sparks.
-    let sparkDirty = false;
-    for (let i = 0; i < MAX_SPARKS; i++) {
-      const st = this.sparkState[i];
-      if (st.life <= 0) continue;
-      st.life -= dt;
-      const p = i * 3;
-      if (st.life <= 0) {
-        this.sparkPos[p + 1] = -999;
-        sparkDirty = true;
+    // particles
+    const pos = this.points.geometry.getAttribute('position');
+    const col = this.points.geometry.getAttribute('color');
+    const siz = this.points.geometry.getAttribute('size');
+    for (let i = 0; i < MAX_PARTICLES; i += 1) {
+      const p = this.particles[i];
+      if (p.life <= 0) {
+        if (pos.getY(i) > -40) {
+          pos.setY(i, -50);
+        }
         continue;
       }
-      st.vy -= 14 * st.grav * dt;
-      this.sparkPos[p] += st.vx * dt;
-      this.sparkPos[p + 1] += st.vy * dt;
-      this.sparkPos[p + 2] += st.vz * dt;
-      if (this.sparkPos[p + 1] < 0.02) {
-        this.sparkPos[p + 1] = 0.02;
-        st.vy = Math.abs(st.vy) * 0.28;
-        st.vx *= 0.6;
-        st.vz *= 0.6;
+      p.life -= dt;
+      const d = Math.exp(-p.drag * dt);
+      p.vx *= d;
+      p.vz *= d;
+      p.vy = p.vy * d + p.gravity * dt;
+      p.x += p.vx * dt;
+      p.y += p.vy * dt;
+      p.z += p.vz * dt;
+      if (p.y < 0.02) {
+        p.y = 0.02;
+        p.vy *= -0.25;
       }
-      const f = clamp(st.life / (st.maxLife || 1), 0, 1);
-      this.sparkCol[p] = f;
-      this.sparkCol[p + 1] = f * 0.72;
-      this.sparkCol[p + 2] = f * 0.35;
-      sparkDirty = true;
+      const k = clamp(p.life / p.max, 0, 1);
+      pos.setXYZ(i, p.x, p.y, p.z);
+      col.setXYZ(i, p.r * k, p.g * k, p.b * k);
+      siz.setX(i, p.size * (p.max < 0.3 ? k : 1 + (1 - k) * 1.4));
     }
-    if (sparkDirty) {
-      this.sparks.geometry.attributes.position.needsUpdate = true;
-      this.sparks.geometry.attributes.color.needsUpdate = true;
-    }
+    pos.needsUpdate = true;
+    col.needsUpdate = true;
+    siz.needsUpdate = true;
 
-    // Smoke.
-    let smokeDirty = false;
-    for (let i = 0; i < MAX_SMOKE; i++) {
-      const st = this.smokeState[i];
-      if (st.life <= 0) continue;
-      st.life -= dt;
-      const p = i * 3;
-      if (st.life <= 0) {
-        this.smokePos[p + 1] = -999;
-        smokeDirty = true;
-        continue;
+    // tracers
+    for (const t of this.tracers) {
+      if (t.life > 0) {
+        t.life -= dt;
+        t.mesh.material.opacity = clamp(t.life / 0.06, 0, 1) * 0.85;
+        if (t.life <= 0) t.mesh.visible = false;
       }
-      this.smokePos[p] += st.vx * dt;
-      this.smokePos[p + 1] += st.vy * dt;
-      this.smokePos[p + 2] += st.vz * dt;
-      st.vx *= 1 - dt * 1.4;
-      st.vz *= 1 - dt * 1.4;
-      const f = clamp(st.life / (st.maxLife || 1), 0, 1);
-      const c = 0.1 + f * 0.7;
-      this.smokeCol[p] = c;
-      this.smokeCol[p + 1] = c;
-      this.smokeCol[p + 2] = c;
-      smokeDirty = true;
-    }
-    if (smokeDirty) {
-      this.smoke.geometry.attributes.position.needsUpdate = true;
-      this.smoke.geometry.attributes.color.needsUpdate = true;
     }
 
-    // Muzzle flash.
-    if (this.flashLife > 0) {
-      this.flashLife -= dt;
-      this.flash.material.opacity = Math.max(0, this.flashLife / 0.055) * 0.95;
-      if (this.flashLife <= 0) this.flash.material.opacity = 0;
+    // muzzle
+    if (this.muzzleLife > 0) {
+      this.muzzleLife -= dt;
+      if (this.muzzleLife <= 0) this.muzzle.visible = false;
     }
 
-    this.shake = Math.max(0, this.shake - dt * 1.6);
-  }
-
-  addShake(amount) {
-    this.shake = Math.min(1.4, this.shake + amount);
+    // rain follows the camera and falls
+    if (this.rainEnabled) {
+      const cam = this.game.camera;
+      const attr = this.rain.geometry.getAttribute('position');
+      const arr = attr.array;
+      const cx = cam.position.x;
+      const cz = cam.position.z;
+      for (let i = 0; i < this.rainCount; i += 1) {
+        const o = i * 6;
+        const fall = this.rainVel[i] * dt;
+        arr[o + 1] -= fall;
+        arr[o + 4] -= fall;
+        if (arr[o + 4] < 0) {
+          const x = cx + randRange(this.rng, -55, 55);
+          const z = cz + randRange(this.rng, -55, 55);
+          const len = randRange(this.rng, 0.5, 1.3);
+          arr[o] = x;
+          arr[o + 1] = 38 + this.rng() * 8;
+          arr[o + 2] = z;
+          arr[o + 3] = x + 0.06;
+          arr[o + 4] = 38 + this.rng() * 8 - len;
+          arr[o + 5] = z;
+        }
+      }
+      attr.needsUpdate = true;
+    }
   }
 }

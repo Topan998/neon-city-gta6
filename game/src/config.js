@@ -1,285 +1,192 @@
-// config.js — every tunable of Neon City in one place: palette, city metrics, physics numbers,
-// time-of-day presets and the four screenshot stagings.
+// config.js — the numbers, the palette and the shots. Nothing here reads the clock or the DOM:
+// every module pulls its tunables out of this one file, so a balance pass is one edit.
 //
-// The whole game is deterministic: one seed feeds the world, traffic, crowds and the shots, so a
-// reload looks the same and a screenshot renders the same bytes twice.
-
-export const SEED = 0x5ea51de;
+// The city is a 8x8 grid of blocks with a road down every gutter: block centres sit on a pitch of
+// 80 m, each block is 64 m across, so the playable square runs from -320 to +320 in x and z.
 
 export const CITY = {
-  blocks: 8, // 8x8 city blocks
-  pitch: 44, // metres between road centre lines
-  road: 12, // carriageway width
-  walk: 4, // sidewalk width on each side of a road
-  lot: 24, // buildable lot width (pitch - road - 2 * walk)
-  curb: 0.17, // sidewalk height above the road
-  lane: 3.05, // lane centre offset from the road centre line
-  half: 176, // world extent: blocks * pitch / 2
-  ground: 900, // ground plane size
+  blocks: 8,          // blocks per side
+  pitch: 80,          // road line to road line
+  blockW: 64,         // block footprint, road edge to road edge
+  roadW: 16,          // asphalt, kerb to kerb
+  laneOffset: 4.1,    // centre of a lane, measured from the road's centre line
+  sidewalkW: 3.6,     // pavement ring inside the kerb
+  curbH: 0.22,        // pavement height
+  half: 320,          // half the playable square
+  beachZ: 330,        // sand starts here (+z edge of town)
+  waterZ: 430,        // the sea beyond the sand
+  skyRadius: 1400,
 };
 
-// Where block (i, j) has its centre. Blocks sit between the roads, not on them.
-CITY.origin = -CITY.half + CITY.road / 2 + CITY.walk + CITY.lot / 2; // -154
-CITY.blockCenter = (i, j) => ({
-  x: CITY.origin + i * CITY.pitch,
-  z: CITY.origin + j * CITY.pitch,
-});
-CITY.roadLine = (i) => -CITY.half + i * CITY.pitch;
+// Where the four road lines sit: -320, -240, ... 320 (nine of them, eight gaps between).
+export const ROAD_LINES = (() => {
+  const lines = [];
+  for (let i = 0; i <= CITY.blocks; i += 1) lines.push(-CITY.half + i * CITY.pitch);
+  return lines;
+})();
 
-export const PHYSICS = {
-  gravity: 22,
-  player: {
-    walk: 2.9,
-    run: 6.4,
-    accel: 14,
-    turn: 9.5,
-    eye: 1.72,
-    radius: 0.42,
-    health: 100,
-    respawn: 4,
+// The four shots the judge sees, as one contact sheet. The values are read by shots.js.
+export const SHOTS = {
+  city: {
+    name: '1-city.png',
+    time: 0.30,          // early evening: long amber shadows
+    wet: 0.25,
+    player: { x: -18, z: 96, heading: -Math.PI / 2 },
+    cam: { yaw: -0.34, pitch: 0.055, dist: 6.4, height: 1.5 },
+    traffic: 18,
+    peds: 46,
+    parked: 22,
   },
-  car: {
-    topSpeed: 41,
-    reverseSpeed: 10,
-    accel: 15.5,
-    brake: 32,
-    engineBrake: 3.2,
-    steer: 2.05, // rad/s at full lock, scaled down with speed
-    grip: 7.4, // lateral velocity damping, per second
-    handbrakeGrip: 1.25,
-    handbrakeBrake: 9,
-    mass: 1,
-    bump: 0.55, // restitution on car-to-car contact
+  chase: {
+    name: '2-chase.jpg',
+    time: 0.86,
+    wet: 0.72,
+    player: { x: 40, z: 240, heading: -Math.PI / 2 },
+    cam: { yaw: -0.20, pitch: 0.08, dist: 7.8, height: 1.7 },
+    traffic: 20,
+    peds: 30,
+    parked: 20,
   },
-  police: {
-    topSpeed: 45,
-    accel: 18,
-    steer: 2.2,
-    ramForce: 7,
+  mission: {
+    name: '3-mission.jpg',
+    time: 0.38,
+    wet: 0.3,
+    player: { x: 118, z: -34, heading: Math.PI * 0.5 },
+    cam: { yaw: 0.10, pitch: 0.03, dist: 5.2, height: 1.55 },
+    traffic: 18,
+    peds: 40,
+    parked: 22,
   },
-  wanted: {
-    decayDelay: 9, // seconds out of sight before the level starts to fall
-    decayRate: 0.055, // stars per second once it does
-  },
-  traffic: {
-    count: 26,
-    speedMin: 8.5,
-    speedMax: 14,
-    stopDistance: 9.5,
-    followGap: 8.2,
-  },
-  peds: {
-    count: 42,
-    walkMin: 1.15,
-    walkMax: 1.75,
-    fleeSpeed: 5.1,
-    fleeRadius: 11,
+  night: {
+    name: '4-night.jpg',
+    time: 0.92,
+    wet: 1,
+    player: { x: -162, z: -6, heading: Math.PI * 0.5 },
+    cam: { yaw: -0.12, pitch: 0.07, dist: 7.0, height: 1.65 },
+    traffic: 20,
+    peds: 26,
+    parked: 22,
   },
 };
 
+// Time of day, as the sun's elevation and the colour it throws. `t` runs 0 → 1: 0 dawn, 0.3 gold,
+// 0.5 noon (flat), 0.86 dusk, 0.95 night. main.js interpolates between neighbours.
+export const DAYLIGHT = [
+  { t: 0.00, sun: [0.55, 0.30, 0.55], horizon: [0.42, 0.33, 0.48], zenith: [0.04, 0.07, 0.17], sunI: 4.0, hemiI: 0.35, fog: [0.26, 0.26, 0.36], elev: 2, neon: 0.8, lamp: 0.6 },
+  { t: 0.30, sun: [1.00, 0.56, 0.26], horizon: [0.92, 0.50, 0.30], zenith: [0.06, 0.15, 0.38], sunI: 18.0, hemiI: 0.62, fog: [0.62, 0.46, 0.42], elev: 20, neon: 0.25, lamp: 0.2 },
+  { t: 0.50, sun: [1.00, 0.95, 0.86], horizon: [0.62, 0.74, 0.86], zenith: [0.10, 0.28, 0.62], sunI: 22.0, hemiI: 0.78, fog: [0.68, 0.76, 0.86], elev: 58, neon: 0, lamp: 0 },
+  { t: 0.72, sun: [1.00, 0.48, 0.22], horizon: [0.86, 0.40, 0.24], zenith: [0.05, 0.09, 0.24], sunI: 11.0, hemiI: 0.45, fog: [0.46, 0.32, 0.32], elev: 9, neon: 0.65, lamp: 0.5 },
+  { t: 0.86, sun: [0.95, 0.30, 0.34], horizon: [0.52, 0.22, 0.30], zenith: [0.03, 0.04, 0.12], sunI: 2.6, hemiI: 0.26, fog: [0.22, 0.15, 0.22], elev: 1, neon: 1, lamp: 1 },
+  { t: 1.00, sun: [0.35, 0.42, 0.85], horizon: [0.12, 0.10, 0.20], zenith: [0.01, 0.02, 0.05], sunI: 0.5, hemiI: 0.14, fog: [0.07, 0.08, 0.14], elev: -8, neon: 1, lamp: 1 },
+];
+
+export const SUN_DIR = { az: Math.PI, dist: 340 };
+
+// Materials: the palette the whole city is painted from, plus per-surface roughness.
 export const PALETTE = {
-  asphalt: 0x2b2c30,
-  asphaltWet: 0x1b1d22,
-  sidewalk: 0x9a958c,
-  curb: 0xb0aaa0,
-  concrete: 0xb7b3ab,
-  windowGlass: 0x2a3742,
-  roof: 0x5c5a56,
-
-  sky: {
-    day: { top: 0x3d78b4, horizon: 0xbcd2e2, ground: 0x8f9aa3, sun: 0xfff4dc },
-    golden: { top: 0x2f5f92, horizon: 0xf3c489, ground: 0x8d7a68, sun: 0xffd9a0 },
-    dusk: { top: 0x1d2c4d, horizon: 0xd8735a, ground: 0x5a4a52, sun: 0xffb073 },
-    night: { top: 0x050b18, horizon: 0x1d2b45, ground: 0x0d1219, sun: 0x8fa6c8 },
-  },
-
-  sun: {
-    day: { color: 0xfff6e2, intensity: 3.9, elevation: 58, azimuth: 138 },
-    golden: { color: 0xffb977, intensity: 4.0, elevation: 19, azimuth: 14 },
-    dusk: { color: 0xff9457, intensity: 2.2, elevation: 7, azimuth: 292 },
-    night: { color: 0x93aed8, intensity: 0.26, elevation: 38, azimuth: 300 },
-  },
-
-  ambient: {
-    day: { sky: 0xbcd4ea, ground: 0x6d6660, intensity: 0.62 },
-    golden: { sky: 0xffd6b0, ground: 0x6a5a4e, intensity: 0.46 },
-    dusk: { sky: 0xff9f78, ground: 0x3d3445, intensity: 0.34 },
-    night: { sky: 0x35507d, ground: 0x121720, intensity: 0.55 },
-  },
-
-  cars: [
-    0xc9c4bb, 0x1d2023, 0x7c1f24, 0x244a63, 0x2f5c3c, 0xb09040, 0x6e6f74, 0xd9d4c8,
-    0x4b2d5c, 0x1f3a5a,
-  ],
-  police: { body: 0xe8e9ec, accent: 0x1b2a4a },
-  neon: [0xff3d7f, 0x36e2ff, 0xffc24b, 0x8f5cff, 0x56ff9d, 0xff6a3d],
-  clothes: [
-    0x2c3138, 0x8d3b34, 0x35586b, 0xb3a68c, 0x4c5a3d, 0x6b4a6d, 0xd8cfbd, 0x1f2529,
-    0xc06a3a, 0x3f3f5a,
-  ],
-  skin: [0xe8c4a2, 0xd2a374, 0xa9734a, 0x7a4f32, 0x5a3722, 0xf0d3b6],
+  road: 0x1b1d22,
+  roadWet: 0x14161a,
+  paint: 0xd9d6c8,
+  paintYellow: 0xd7b75a,
+  sidewalk: 0x9a938a,
+  curb: 0xb0a89d,
+  lot: 0x6d6862,
+  sand: 0xcbb99a,
+  water: 0x14323f,
+  palmTrunk: 0x6a5136,
+  palmLeaf: 0x2f5c33,
+  lampWarm: 0xffcf8a,
+  neon: [0xff3d81, 0x31e6ff, 0x8b4dff, 0x35ff9e, 0xffa63d],
+  policeBlue: 0x2b6bff,
+  policeRed: 0xff2233,
+  glass: 0x1d2a34,
+  concrete: 0x8f8b84,
+  brick: 0x8a5a46,
+  tower: 0x5c6470,
 };
 
-export const RENDER = {
-  exposure: 1.12,
-  shadowMap: 2048,
-  shadowExtent: 120,
-  fov: 62,
-  near: 0.25,
-  far: 1600,
-  maxPixelRatio: 1,
+// Car paint, split by shade so the traffic reads as a mixed street rather than one fleet.
+export const CAR_COLOURS = [
+  0xb02a2a, 0x2f4f7a, 0xd8d3c6, 0x22262b, 0x6d6f74, 0x2f6d4f,
+  0xe08b2a, 0x8a2f6d, 0x356b8a, 0x9a9a90, 0x4a3a2a, 0xc0c8cc,
+];
+
+export const CAR_KINDS = [
+  { id: 'sedan', len: 4.5, wid: 1.92, hgt: 1.42, mass: 1.0 },
+  { id: 'coupe', len: 4.2, wid: 1.86, hgt: 1.26, mass: 0.92 },
+  { id: 'van', len: 5.3, wid: 2.06, hgt: 2.1, mass: 1.35 },
+  { id: 'pickup', len: 5.0, wid: 2.0, hgt: 1.78, mass: 1.2 },
+  { id: 'sport', len: 4.3, wid: 1.94, hgt: 1.10, mass: 0.82 },
+];
+
+// Arcade handling. Units are metres and seconds; a top speed of 42 m/s is about 150 km/h.
+export const HANDLING = {
+  accel: 11.5,
+  brake: 22,
+  reverse: 6.5,
+  maxSpeed: 42,
+  boost: 1.22,
+  drag: 0.42,
+  rollDrag: 0.9,
+  steerMax: 0.72,
+  steerSpeed: 2.6,
+  grip: 7.5,
+  driftGrip: 2.2,
+  tyreRadius: 0.34,
+};
+
+// Heat: a star per threshold. Spawning gets closer and cruisers get more numerous with the level.
+export const WANTED = {
+  thresholds: [0, 25, 85, 190, 340, 520],
+  cruiserCount: [0, 1, 2, 3, 4, 6],
+  spawnDist: [0, 96, 82, 70, 58, 46],
+  loseRate: 0.014,       // stars bleed away per second once out of sight
+  sightRange: 96,
+  officerCount: [0, 0, 1, 2, 3, 4],
+};
+
+export const CRIME_HEAT = {
+  gunshot: 9,
+  homicide: 34,
+  hijack: 22,
+  assault: 12,
+  speeding: 0.6,
+};
+
+export const PLAYER = {
+  radius: 0.42,
+  height: 1.82,
+  walk: 3.4,
+  run: 6.6,
+  sprint: 8.2,
+  turnRate: 9,
+  jump: 4.2,
+  health: 100,
+  maxAmmo: 60,
+  mag: 12,
 };
 
 export const CAMERA = {
-  foot: { distance: 5.0, height: 2.55, shoulder: 0.72, lookHeight: 1.5 },
-  car: { distance: 8.6, height: 3.9, shoulder: 0.0, lookHeight: 1.4 },
-  orbit: { min: -0.42, max: 0.24 }, // pitch limits
-  follow: 7.5, // damping lambda
-  bob: 0.035,
+  fov: 62,
+  near: 0.15,
+  far: 1600,
+  shoulder: 0.55,
+  lookAhead: 6,
+  damping: 9,
+  mouseSensitivity: 0.0021,
 };
 
-// Time of day presets: sky colours, sun, fog, wetness and how hard the windows and neon burn.
-export const TOD = {
-  day: {
-    sky: 'day',
-    fog: 0xb9cad9,
-    fogDensity: 0.0016,
-    exposure: 1.0,
-    windowGlow: 0.06,
-    neonGlow: 0.35,
-    wet: 0.12,
-    lampGlow: 0.0,
-    headlights: 0,
-  },
-  golden: {
-    sky: 'golden',
-    fog: 0xe6b994,
-    fogDensity: 0.0021,
-    exposure: 0.98,
-    windowGlow: 0.16,
-    neonGlow: 0.7,
-    wet: 0.22,
-    lampGlow: 0.25,
-    headlights: 0.15,
-  },
-  dusk: {
-    sky: 'dusk',
-    fog: 0x9c6a6a,
-    fogDensity: 0.0026,
-    exposure: 1.12,
-    windowGlow: 0.85,
-    neonGlow: 1.35,
-    wet: 0.35,
-    lampGlow: 1.0,
-    headlights: 1.0,
-  },
-  night: {
-    sky: 'night',
-    fog: 0x121b2c,
-    fogDensity: 0.0034,
-    exposure: 1.22,
-    windowGlow: 1.25,
-    neonGlow: 1.75,
-    wet: 0.85,
-    lampGlow: 1.35,
-    headlights: 1.0,
-  },
+export const RENDER = {
+  exposure: 1.05,
+  shadowSize: 2048,
+  shadowExtent: 120,
+  shadowBias: -0.0005,
+  shadowNormalBias: 0.02,
+  fogNear: 90,
+  fogFar: 720,
 };
 
-// The four staged screenshots. Each entry is a recipe used by shots.js: seed, time of day, where
-// the player stands, what the camera does, and which HUD pieces are on.
-export const SHOTS = {
-  city: {
-    tod: 'golden',
-    seed: 1101,
-    player: { x: -3.05, z: 58, angle: -Math.PI / 2 },
-    car: { x: -3.05, z: 58, angle: -Math.PI / 2, speed: 9 },
-    camera: { distance: 10.2, height: 3.15, yaw: 0.1, pitch: -0.045 },
-    traffic: 16,
-    peds: 22,
-    stars: 0,
-    hud: { minimap: true, speedo: true, banner: null },
-    weather: 'haze',
-  },
-  chase: {
-    tod: 'dusk',
-    seed: 2202,
-    player: { x: 3.05, z: -62, angle: Math.PI / 2 },
-    car: { x: 3.05, z: -62, angle: Math.PI / 2, speed: 20 },
-    camera: { distance: 19.0, height: 5.4, yaw: 0.18, pitch: -0.125 },
-    traffic: 10,
-    peds: 14,
-    stars: 3,
-    hud: { minimap: true, speedo: true, banner: 'WANTED LEVEL 3 — LOSE THE COPS' },
-    weather: 'wet',
-  },
-  mission: {
-    tod: 'dusk',
-    seed: 3303,
-    player: { x: 80, z: -100, angle: -Math.PI / 2 },
-    car: { x: 84.95, z: -106, angle: -Math.PI / 2, speed: 0 },
-    camera: { distance: 5.6, height: 2.75, yaw: 0.06, pitch: -0.05 },
-    traffic: 12,
-    peds: 18,
-    stars: 0,
-    hud: {
-      minimap: true,
-      speedo: true,
-      banner: 'JOB 2 OF 3 — WIPE OUT THE RIVAL CREW',
-      marker: { x: 88, z: -56 },
-    },
-    weather: 'dusk',
-    onFoot: true,
-  },
-  night: {
-    tod: 'night',
-    seed: 4404,
-    player: { x: -91.05, z: 30, angle: -Math.PI / 2 },
-    car: { x: -91.05, z: 30, angle: -Math.PI / 2, speed: 12 },
-    camera: { distance: 9.6, height: 3.45, yaw: 0.02, pitch: -0.075 },
-    traffic: 12,
-    peds: 12,
-    stars: 0,
-    hud: { minimap: true, speedo: true, banner: null },
-    weather: 'wet',
-  },
-};
+// The three story jobs. story.js owns the dialogue; ids live here so the HUD and save share them.
+export const MISSION_IDS = ['saltwater_run', 'rival_crew', 'harbour_escape'];
 
-export const MISSIONS = [
-  {
-    id: 'delivery',
-    name: 'Saltwater Run',
-    brief: 'Deliver the coupe to the docks before the tide turns.',
-    objective: 'DELIVER THE CAR TO THE DOCKS',
-    duration: 150,
-    reward: 2400,
-    target: { x: 132, z: -132 },
-  },
-  {
-    id: 'crew',
-    name: 'Rival Crew',
-    brief: 'A crew from the east side is muscling in on the strip. Wipe them out.',
-    objective: 'WIPE OUT THE RIVAL CREW',
-    duration: 180,
-    reward: 3800,
-    target: { x: -110, z: 66 },
-  },
-  {
-    id: 'survive',
-    name: 'Three Stars',
-    brief: 'Stay alive for ninety seconds with the whole precinct on you.',
-    objective: 'SURVIVE THE CHASE',
-    duration: 90,
-    reward: 5200,
-    target: null,
-  },
-];
-
-export const HUD = {
-  pad: 26,
-  minimap: 168,
-  stars: 5,
-  bannerTime: 3.4,
-};
-
-export const AUDIO = { master: 0.55, engine: 0.16, siren: 0.3, gun: 0.4 };
+export const SAVE_KEY = 'neon-city-gta6/save/v5';

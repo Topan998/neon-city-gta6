@@ -1,457 +1,486 @@
-// player.js — the character rig, its animation, and the third-person camera.
+// player.js — the man you play. A jointed rig with a walk and a run cycle, a third-person camera
+// on pointer lock, a pistol, a health bar, and the enter/exit-car hand-off with the fleet.
 //
-// The rig is a plain hierarchy of boxes: hips, torso, head, two-segment arms and legs, shoes. A
-// phase clock drives a walk/run cycle with knee lift, counter-swinging arms, a lean into speed and a
-// small vertical bob; an aim pose overrides the arms when the trigger is held. The camera trails over
-// the shoulder, damped, with a little bob and a punch of shake from effects.js.
+// The rig is built from boxes on pivot groups: thighs and shins swing and bend, arms counter-swing,
+// the head follows the camera's pitch a little, and the whole thing leans into a sprint.
 
-import THREE from './three-shim.js';
-import { CAMERA, CITY, PHYSICS, PALETTE } from './config.js';
-import { TAU, clamp, lerp, damp, angleDamp, angleDiff, smoothstep, RNG } from './util.js';
+const THREE = window.THREE;
 
-const P = PHYSICS.player;
+import { PLAYER, CAMERA, CAR_KINDS } from './config.js';
+import {
+  TAU, clamp, lerp, damp, dampAngle, angleDelta, smoothstep, standard, GeoBuilder,
+} from './util.js';
 
-function box(w, h, d, mat) {
-  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
-  m.castShadow = true;
-  m.receiveShadow = true;
-  return m;
+const SKIN = [0xd9a877, 0xc48a5e, 0x8d5a3b, 0xe6bc90, 0x6b4327];
+const JACKETS = [0x2b3a4a, 0x6a2f2f, 0x2f4a35, 0x3a3a42, 0x4a3a24, 0x1f2a33];
+const JEANS = [0x2b3340, 0x3a3f4a, 0x4a4438, 0x22262c];
+const SNEAKERS = [0xe8e8e8, 0x2a2a2a, 0xd04a3a, 0x3a5a8a];
+
+/** One limb: a pivot group with a box hanging under it, so rotations look like joints. */
+function limb(parent, { w, h, d, x, y, z, colour, mat }) {
+  const pivot = new THREE.Group();
+  pivot.position.set(x, y, z);
+  const geo = new THREE.BoxGeometry(w, h, d);
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.y = -h / 2;
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  pivot.add(mesh);
+  parent.add(pivot);
+  return { pivot, mesh };
 }
 
+/**
+ * The player character. `game` is the running game object; the rig is added to the scene on
+ * construction and the camera is owned here too.
+ */
 export class Player {
-  constructor(scene, world, rng) {
-    this.scene = scene;
-    this.world = world;
-    this.rng = rng || new RNG(7);
-
-    this.x = 0;
-    this.z = 0;
-    this.y = CITY.curb;
-    this.yaw = 0;
+  constructor(game) {
+    this.game = game;
+    this.rng = game.rng;
+    this.pos = new THREE.Vector3(0, 0, 0);
+    this.vel = new THREE.Vector2(0, 0);
+    this.heading = 0;
     this.speed = 0;
-    this.health = P.health;
-    this.maxHealth = P.health;
-    this.alive = true;
+    this.health = PLAYER.health;
+    this.ammo = PLAYER.mag;
+    this.reserve = PLAYER.maxAmmo;
+    this.reloading = 0;
+    this.aiming = false;
+    this.walkPhase = 0;
     this.inCar = null;
-    this.respawnTimer = 0;
-    this.phase = 0;
-    this.aim = 0;
-    this.recoil = 0;
+    this.alive = true;
+    this.fireCooldown = 0;
+    this.stepTimer = 0;
     this.cameraYaw = 0;
-    this.cameraPitch = -0.06;
-    this.stepAccumulator = 0;
-    this.onFootstep = null;
-    this.ammo = 42;
-    this.clip = 12;
+    this.cameraPitch = 0.04;
+    this.cameraDist = 5.4;
+    this.shake = 0;
+    this.deadTimer = 0;
 
-    this.build();
+    this.buildRig();
+    this.buildPistol();
   }
 
-  build() {
-    const skinMat = new THREE.MeshStandardMaterial({ color: PALETTE.skin[1], roughness: 0.68, metalness: 0.02 });
-    const jacketMat = new THREE.MeshStandardMaterial({ color: 0x232a33, roughness: 0.62, metalness: 0.08 });
-    const jeansMat = new THREE.MeshStandardMaterial({ color: 0x2c3747, roughness: 0.82, metalness: 0.03 });
-    const shoeMat = new THREE.MeshStandardMaterial({ color: 0x14161a, roughness: 0.55, metalness: 0.1 });
-    const hairMat = new THREE.MeshStandardMaterial({ color: 0x1a1512, roughness: 0.85, metalness: 0.02 });
-    this.mats = { skin: skinMat, jacket: jacketMat, jeans: jeansMat, shoe: shoeMat, hair: hairMat };
+  buildRig() {
+    const skin = SKIN[Math.floor(this.rng() * SKIN.length)];
+    const jacket = JACKETS[Math.floor(this.rng() * JACKETS.length)];
+    const jeans = JEANS[Math.floor(this.rng() * JEANS.length)];
+    const shoes = SNEAKERS[Math.floor(this.rng() * SNEAKERS.length)];
+    this.colours = { skin, jacket, jeans, shoes };
+
+    this.matSkin = standard({ color: skin, roughness: 0.72, metalness: 0.02 });
+    this.matJacket = standard({ color: jacket, roughness: 0.55, metalness: 0.12 });
+    this.matJeans = standard({ color: jeans, roughness: 0.85, metalness: 0.04 });
+    this.matShoe = standard({ color: shoes, roughness: 0.6, metalness: 0.06 });
+    this.matHair = standard({ color: 0x1d1712, roughness: 0.9, metalness: 0.02 });
 
     const root = new THREE.Group();
     root.name = 'player';
     this.root = root;
-    this.scene.add(root);
 
-    // The body group carries the bob so the rig's pivots stay on clean numbers.
-    const body = new THREE.Group();
-    root.add(body);
-    this.body = body;
+    // hips and torso
+    const hips = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.22, 0.24), this.matJeans);
+    hips.position.y = 0.94;
+    hips.castShadow = true;
+    hips.receiveShadow = true;
+    root.add(hips);
 
-    this.hips = new THREE.Group();
-    this.hips.position.y = 0.94;
-    body.add(this.hips);
+    const torso = new THREE.Mesh(new THREE.BoxGeometry(0.44, 0.56, 0.26), this.matJacket);
+    torso.position.y = 1.33;
+    torso.castShadow = true;
+    torso.receiveShadow = true;
+    root.add(torso);
+    this.torso = torso;
 
-    const pelvis = box(0.44, 0.24, 0.26, jeansMat);
-    pelvis.position.y = 0.02;
-    this.hips.add(pelvis);
+    // shoulders and neck
+    const shoulders = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.14, 0.28), this.matJacket);
+    shoulders.position.y = 1.6;
+    shoulders.castShadow = true;
+    root.add(shoulders);
 
-    // Torso, tapering to the shoulders.
-    const torso = box(0.5, 0.56, 0.3, jacketMat);
-    torso.position.y = 0.42;
-    this.hips.add(torso);
-    const chest = box(0.54, 0.2, 0.32, jacketMat);
-    chest.position.y = 0.68;
-    this.hips.add(chest);
+    const neck = new THREE.Mesh(new THREE.BoxGeometry(0.13, 0.1, 0.13), this.matSkin);
+    neck.position.y = 1.7;
+    root.add(neck);
 
-    // Neck and head.
-    const neck = box(0.13, 0.1, 0.13, skinMat);
-    neck.position.y = 0.8;
-    this.hips.add(neck);
-    const head = new THREE.Mesh(new THREE.SphereGeometry(0.145, 14, 12), skinMat);
-    head.scale.set(0.94, 1.05, 0.98);
-    head.position.y = 0.94;
-    head.castShadow = true;
-    this.hips.add(head);
+    // head: a box with hair over the top and a hint of a face
+    const head = new THREE.Group();
+    head.position.y = 1.83;
+    const skull = new THREE.Mesh(new THREE.BoxGeometry(0.23, 0.26, 0.24), this.matSkin);
+    skull.castShadow = true;
+    head.add(skull);
+    const hair = new THREE.Mesh(new THREE.BoxGeometry(0.245, 0.11, 0.25), this.matHair);
+    hair.position.y = 0.09;
+    hair.castShadow = true;
+    head.add(hair);
+    const nose = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.05, 0.05), this.matSkin);
+    nose.position.set(0, -0.01, 0.13);
+    head.add(nose);
+    root.add(head);
     this.head = head;
 
-    const hair = new THREE.Mesh(new THREE.SphereGeometry(0.152, 12, 10, 0, TAU, 0, 1.5), hairMat);
-    hair.position.y = 0.955;
-    hair.scale.set(1, 1.02, 1.02);
-    this.hips.add(hair);
+    // arms: upper arm pivot at the shoulder, forearm pivot at the elbow
+    this.armR = limb(root, { w: 0.13, h: 0.28, d: 0.14, x: 0.28, y: 1.59, z: 0, colour: jacket, mat: this.matJacket });
+    this.armL = limb(root, { w: 0.13, h: 0.28, d: 0.14, x: -0.28, y: 1.59, z: 0, colour: jacket, mat: this.matJacket });
+    this.foreR = limb(this.armR.pivot, { w: 0.11, h: 0.27, d: 0.12, x: 0, y: -0.28, z: 0, colour: skin, mat: this.matSkin });
+    this.foreL = limb(this.armL.pivot, { w: 0.11, h: 0.27, d: 0.12, x: 0, y: -0.28, z: 0, colour: skin, mat: this.matSkin });
 
-    // Arms: shoulder pivot -> upper arm -> elbow -> forearm -> hand.
-    this.arms = [];
-    for (const side of [-1, 1]) {
-      const shoulder = new THREE.Group();
-      shoulder.position.set(side * 0.31, 0.68, 0);
-      this.hips.add(shoulder);
-      const upper = box(0.12, 0.3, 0.13, jacketMat);
-      upper.position.y = -0.15;
-      shoulder.add(upper);
-      const elbow = new THREE.Group();
-      elbow.position.y = -0.3;
-      shoulder.add(elbow);
-      const fore = box(0.105, 0.28, 0.115, jacketMat);
-      fore.position.y = -0.14;
-      elbow.add(fore);
-      const hand = box(0.1, 0.11, 0.1, skinMat);
-      hand.position.y = -0.3;
-      elbow.add(hand);
-      this.arms.push({ side, shoulder, elbow });
-    }
+    // legs
+    this.thighR = limb(root, { w: 0.17, h: 0.42, d: 0.18, x: 0.11, y: 0.88, z: 0, colour: jeans, mat: this.matJeans });
+    this.thighL = limb(root, { w: 0.17, h: 0.42, d: 0.18, x: -0.11, y: 0.88, z: 0, colour: jeans, mat: this.matJeans });
+    this.shinR = limb(this.thighR.pivot, { w: 0.15, h: 0.42, d: 0.16, x: 0, y: -0.42, z: 0, colour: jeans, mat: this.matJeans });
+    this.shinL = limb(this.thighL.pivot, { w: 0.15, h: 0.42, d: 0.16, x: 0, y: -0.42, z: 0, colour: jeans, mat: this.matJeans });
+    this.footR = limb(this.shinR.pivot, { w: 0.16, h: 0.1, d: 0.28, x: 0, y: -0.42, z: 0.05, colour: shoes, mat: this.matShoe });
+    this.footL = limb(this.shinL.pivot, { w: 0.16, h: 0.1, d: 0.28, x: 0, y: -0.42, z: 0.05, colour: shoes, mat: this.matShoe });
 
-    // Legs: hip pivot -> thigh -> knee -> shin -> shoe.
-    this.legs = [];
-    for (const side of [-1, 1]) {
-      const hip = new THREE.Group();
-      hip.position.set(side * 0.13, -0.02, 0);
-      this.hips.add(hip);
-      const thigh = box(0.17, 0.42, 0.18, jeansMat);
-      thigh.position.y = -0.21;
-      hip.add(thigh);
-      const knee = new THREE.Group();
-      knee.position.y = -0.42;
-      hip.add(knee);
-      const shin = box(0.15, 0.4, 0.16, jeansMat);
-      shin.position.y = -0.2;
-      knee.add(shin);
-      const shoe = box(0.17, 0.1, 0.29, shoeMat);
-      shoe.position.set(0, -0.42, 0.05);
-      knee.add(shoe);
-      this.legs.push({ side, hip, knee });
-    }
-
-    // A small petrol-blue jacket detail so the back reads at a distance.
-    const stripe = box(0.52, 0.06, 0.31, new THREE.MeshStandardMaterial({ color: 0x7a2f3a, roughness: 0.6 }));
-    stripe.position.y = 0.62;
-    this.hips.add(stripe);
-
-    // Muzzle offset in front of the right hand, used by effects and the shot code.
-    this.gun = new THREE.Group();
-    const gunBody = box(0.06, 0.09, 0.26, new THREE.MeshStandardMaterial({ color: 0x181a1d, metalness: 0.7, roughness: 0.35 }));
-    gunBody.position.set(0, 0, 0.1);
-    this.gun.add(gunBody);
-    this.gun.position.set(0.16, 0.62, 0.22);
-    this.gun.visible = false;
-    this.hips.add(this.gun);
+    this.game.scene.add(root);
   }
 
-  place(x, z, yaw = 0) {
-    this.x = x;
-    this.z = z;
-    this.y = this.world.groundHeight(x, z);
-    this.yaw = yaw;
-    this.cameraYaw = yaw;
-    this.sync();
+  /** A small blocky pistol, held in the right hand, only visible on foot. */
+  buildPistol() {
+    const g = new THREE.Group();
+    const dark = standard({ color: 0x22242a, roughness: 0.45, metalness: 0.7 });
+    const slide = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.055, 0.24), dark);
+    slide.position.z = 0.06;
+    g.add(slide);
+    const grip = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.13, 0.06), standard({ color: 0x14161a, roughness: 0.8 }));
+    grip.position.set(0, -0.08, -0.03);
+    grip.rotation.x = 0.22;
+    g.add(grip);
+    const muzzle = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.03, 0.02), new THREE.MeshBasicMaterial({ color: 0xffd9a0 }));
+    muzzle.position.z = 0.19;
+    g.add(muzzle);
+    this.muzzleFlash = muzzle;
+    muzzle.visible = false;
+    g.position.set(0, -0.06, 0.14);
+    this.foreR.pivot.add(g);
+    this.pistol = g;
   }
 
-  sync() {
-    this.root.position.set(this.x, this.y, this.z);
-    this.root.rotation.y = this.yaw;
+  /** Put the man on the pavement at a spot. */
+  setPosition(x, z, heading = this.heading) {
+    const y = this.game.world.groundY(x, z);
+    this.pos.set(x, y, z);
+    this.heading = heading;
+    this.vel.set(0, 0);
+    this.syncRig(0.016);
+    this.updateCamera(0.016, true);
   }
 
-  get forwardX() {
-    return Math.cos(this.yaw);
-  }
-  get forwardZ() {
-    return -Math.sin(this.yaw);
+  get forward() {
+    return new THREE.Vector2(Math.sin(this.heading), Math.cos(this.heading));
   }
 
-  // Input: {fwd, strafe, run, aim, fire} in camera space.
-  update(dt, input, effects) {
+  /** Read the input state into motion, then animate. Runs on foot only. */
+  update(dt, input) {
     if (this.inCar) {
-      this.root.visible = false;
+      this.updateInCar(dt, input);
       return;
     }
-    this.root.visible = true;
-
+    const wishX = (input.right ? 1 : 0) - (input.left ? 1 : 0);
+    const wishZ = (input.forward ? 1 : 0) - (input.back ? 1 : 0);
     const camYaw = this.cameraYaw;
-    const cfx = Math.cos(camYaw);
-    const cfz = -Math.sin(camYaw);
-    const crx = Math.sin(camYaw);
-    const crz = Math.cos(camYaw);
-
-    let mx = cfx * input.fwd + crx * input.strafe;
-    let mz = cfz * input.fwd + crz * input.strafe;
-    const mag = Math.hypot(mx, mz);
-    if (mag > 1e-3) {
-      mx /= mag;
-      mz /= mag;
+    // movement is relative to where the camera looks
+    const fwd = new THREE.Vector2(Math.sin(camYaw), Math.cos(camYaw));
+    const right = new THREE.Vector2(Math.cos(camYaw), -Math.sin(camYaw));
+    let moveX = fwd.x * wishZ + right.x * wishX;
+    let moveZ = fwd.y * wishZ + right.y * wishX;
+    const mag = Math.hypot(moveX, moveZ);
+    if (mag > 0.001) {
+      moveX /= mag;
+      moveZ /= mag;
     }
-    const wishSpeed = (input.run ? P.run : P.walk) * Math.min(1, mag);
-    const moving = mag > 0.05;
+    const running = input.run && mag > 0.01;
+    const sprint = input.sprint && running;
+    const targetSpeed = mag > 0.01 ? (sprint ? PLAYER.sprint : running ? PLAYER.run : PLAYER.walk) : 0;
+    const accel = mag > 0.01 ? 14 : 12;
+    this.speed = damp(this.speed, targetSpeed, accel, dt);
 
-    if (moving) {
-      const targetYaw = Math.atan2(-mz, mx);
-      this.yaw = angleDamp(this.yaw, targetYaw, 11, dt);
+    if (this.aiming) {
+      // standing and shooting: turn the body to face where the camera looks
+      this.heading = dampAngle(this.heading, this.cameraYaw, 12, dt);
+    }
+    if (mag > 0.01) {
+      const want = Math.atan2(moveX, moveZ);
+      this.heading = dampAngle(this.heading, want, PLAYER.turnRate, dt);
+      this.vel.set(moveX * this.speed, moveZ * this.speed);
+    } else {
+      this.vel.multiplyScalar(Math.exp(-10 * dt));
     }
 
-    const accel = moving ? P.accel : P.accel * 1.8;
-    this.speed = damp(this.speed, wishSpeed, accel, dt);
+    this.pos.x += this.vel.x * dt;
+    this.pos.z += this.vel.y * dt;
+    const fixed = this.game.world.resolveCircle(this.pos.x, this.pos.z, PLAYER.radius);
+    this.pos.x = fixed.x;
+    this.pos.z = fixed.z;
+    this.pos.x = clamp(this.pos.x, -318, 318);
+    this.pos.z = clamp(this.pos.z, -318, 318);
+    const gy = this.game.world.groundY(this.pos.x, this.pos.z);
+    this.pos.y = damp(this.pos.y, gy, 16, dt);
 
-    if (this.speed > 0.01) {
-      this.x += Math.cos(this.yaw) * this.speed * dt;
-      this.z += -Math.sin(this.yaw) * this.speed * dt;
+    // footsteps
+    if (this.speed > 0.6) {
+      this.stepTimer -= dt * (this.speed / 3.4);
+      if (this.stepTimer <= 0) {
+        this.stepTimer = 0.52;
+        this.game.audio?.footstep(this.speed > PLAYER.walk + 0.6);
+        this.game.effects?.dust(this.pos.x, this.pos.y + 0.05, this.pos.z);
+      }
+    } else {
+      this.stepTimer = 0.2;
     }
 
-    // Keep the walker out of the buildings and inside the city.
-    const push = this.world.buildingPush(this.x, this.z, P.radius);
-    if (push) {
-      this.x += push.x;
-      this.z += push.z;
-      this.speed *= 0.5;
+    this.animate(dt);
+    this.updateWeapon(dt);
+    this.syncRig(dt);
+    this.updateCamera(dt);
+  }
+
+  /** Walk / run cycle: knees lift, arms counter-swing, the body bobs. */
+  animate(dt) {
+    const speed = this.speed;
+    const moving = speed > 0.25;
+    const stride = clamp(speed / PLAYER.run, 0.25, 1.35);
+    if (moving) this.walkPhase += dt * (3.4 + speed * 0.85);
+    const p = this.walkPhase;
+    const swing = moving ? Math.sin(p) * (0.55 + stride * 0.45) : 0;
+    const counter = moving ? Math.sin(p + Math.PI) * (0.5 + stride * 0.4) : 0;
+
+    // legs
+    this.thighR.pivot.rotation.x = swing;
+    this.thighL.pivot.rotation.x = counter;
+    // knees bend most as the leg comes forward
+    const kneeR = moving ? Math.max(0, -Math.sin(p + 0.7)) * (0.7 + stride * 0.5) : 0.05;
+    const kneeL = moving ? Math.max(0, -Math.sin(p + Math.PI + 0.7)) * (0.7 + stride * 0.5) : 0.05;
+    this.shinR.pivot.rotation.x = kneeR;
+    this.shinL.pivot.rotation.x = kneeL;
+    this.footR.pivot.rotation.x = -kneeR * 0.4 + swing * 0.25;
+    this.footL.pivot.rotation.x = -kneeL * 0.4 + counter * 0.25;
+
+    // arms swing opposite the legs; the right arm holds the pistol out when aiming
+    const aimRight = this.aiming ? -1.45 : counter * 0.8;
+    this.armR.pivot.rotation.x = damp(this.armR.pivot.rotation.x, aimRight, 14, dt);
+    this.armL.pivot.rotation.x = damp(this.armL.pivot.rotation.x, this.aiming ? -1.1 : swing * 0.8, 14, dt);
+    this.armR.pivot.rotation.z = damp(this.armR.pivot.rotation.z, this.aiming ? 0.15 : 0.12, 10, dt);
+    this.armL.pivot.rotation.z = -0.12;
+    this.foreR.pivot.rotation.x = damp(this.foreR.pivot.rotation.x, this.aiming ? -0.1 : -0.45 - Math.abs(swing) * 0.2, 12, dt);
+    this.foreL.pivot.rotation.x = -0.45;
+
+    // torso lean and bob
+    const bob = moving ? Math.abs(Math.sin(p)) * 0.035 * stride : 0;
+    this.root.position.y = this.pos.y + bob;
+    this.torso.rotation.x = damp(this.torso.rotation.x, moving ? clamp(speed / 40, 0, 0.1) : 0, 8, dt);
+    this.root.rotation.z = damp(this.root.rotation.z, moving ? Math.sin(p) * 0.02 * stride : 0, 8, dt);
+    // head looks where the camera looks
+    this.head.rotation.x = damp(this.head.rotation.x, clamp(-this.cameraPitch * 0.8, -0.5, 0.5), 10, dt);
+  }
+
+  /** Position and orient the rig from the simulation state (and hide it inside a car). */
+  syncRig(dt) {
+    this.root.position.x = this.pos.x;
+    this.root.position.z = this.pos.z;
+    if (!this.root.position.y) this.root.position.y = this.pos.y;
+    this.root.rotation.y = this.heading;
+    this.root.visible = !this.inCar;
+  }
+
+  /** The pistol: cooldown, reload, muzzle flash, recoil. */
+  updateWeapon(dt) {
+    this.fireCooldown = Math.max(0, this.fireCooldown - dt);
+    if (this.muzzleTimer > 0) {
+      this.muzzleTimer -= dt;
+      this.muzzleFlash.visible = this.muzzleTimer > 0;
     }
-    const lim = CITY.half - 6;
-    this.x = clamp(this.x, -lim, lim);
-    this.z = clamp(this.z, -lim, lim);
-
-    // Ground height: kerbs are a step, not a wall.
-    const gy = this.world.groundHeight(this.x, this.z);
-    this.y = damp(this.y, gy, 14, dt);
-
-    // Animation clock.
-    const stride = input.run ? 2.05 : 1.55;
-    this.phase += (this.speed / stride) * TAU * dt;
-    this.aim = damp(this.aim, input.aim ? 1 : 0, 12, dt);
-    this.recoil = Math.max(0, this.recoil - dt * 5.5);
-
-    this.animate(dt, input);
-
-    this.sync();
-
-    // Footsteps, roughly twice a stride.
-    this.stepAccumulator += this.speed * dt;
-    if (this.stepAccumulator > (input.run ? 1.35 : 0.95)) {
-      this.stepAccumulator = 0;
-      if (this.onFootstep) this.onFootstep(this.speed);
-      if (effects) effects.dust(this.x, this.y + 0.04, this.z, 0.4);
+    if (this.reloading > 0) {
+      this.reloading -= dt;
+      if (this.reloading <= 0) {
+        const need = PLAYER.mag - this.ammo;
+        const take = Math.min(need, this.reserve);
+        this.ammo += take;
+        this.reserve -= take;
+      }
     }
   }
 
-  animate(dt, input) {
-    const speedN = clamp(this.speed / P.run, 0, 1.2);
-    const swing = lerp(0.52, 0.92, clamp(this.speed / P.run, 0, 1));
-    const bob = Math.abs(Math.sin(this.phase)) * (0.02 + speedN * 0.05);
-    const lean = speedN * 0.16;
-
-    this.body.position.y = bob;
-    this.hips.rotation.x = lean * 0.55;
-    this.hips.rotation.z = Math.sin(this.phase) * 0.02 * speedN;
-
-    for (const leg of this.legs) {
-      const p = this.phase + (leg.side > 0 ? 0 : Math.PI);
-      const s = Math.sin(p);
-      const c = Math.cos(p);
-      leg.hip.rotation.x = s * swing;
-      // Knees bend only on the way through, never backwards.
-      const bend = Math.max(0, -c) * (0.55 + speedN * 0.75);
-      leg.knee.rotation.x = -bend - 0.04;
-      leg.hip.rotation.z = leg.side * 0.03;
-    }
-
-    for (const arm of this.arms) {
-      const p = this.phase + (arm.side > 0 ? Math.PI : 0);
-      const s = Math.sin(p);
-      const armSwing = s * swing * 0.75;
-      const aimBlend = this.aim;
-      // Aim: both arms up and forward, elbows bent; the right one carries the gun.
-      const aimShoulder = arm.side > 0 ? -1.25 : -1.05;
-      const aimElbow = arm.side > 0 ? -0.25 : -0.55;
-      arm.shoulder.rotation.x = lerp(armSwing, aimShoulder, aimBlend);
-      arm.shoulder.rotation.y = lerp(0, arm.side > 0 ? -0.22 : 0.45, aimBlend);
-      arm.elbow.rotation.x = lerp(-0.22 - Math.max(0, s) * 0.3, aimElbow, aimBlend);
-      arm.shoulder.rotation.z = arm.side * (0.06 + speedN * 0.05);
-    }
-
-    // Recoil kicks the upper body back for a few frames.
-    this.hips.rotation.x += this.recoil * 0.12;
-    this.gun.visible = this.aim > 0.15;
-    this.gun.position.set(0.16, 0.62 + Math.sin(this.phase) * 0.01, 0.22);
-    this.gun.rotation.x = -this.recoil * 0.4;
-  }
-
-  muzzle(out = new THREE.Vector3()) {
-    const yaw = this.yaw;
-    const fx = Math.cos(yaw);
-    const fz = -Math.sin(yaw);
-    out.set(this.x + fx * 0.55, this.y + 1.32, this.z + fz * 0.55);
-    return out;
-  }
-
-  fire() {
-    if (this.clip <= 0) {
-      if (this.ammo <= 0) return false;
-      this.clip = Math.min(12, this.ammo);
-      this.ammo -= this.clip;
+  /** Fire the pistol along the camera's aim. */
+  tryFire() {
+    if (this.fireCooldown > 0 || this.inCar || !this.alive) return false;
+    if (this.reloading > 0) return false;
+    if (this.ammo <= 0) {
+      this.reload();
       return false;
     }
-    this.clip -= 1;
-    this.recoil = 1;
+    this.ammo -= 1;
+    this.fireCooldown = 0.2;
+    this.muzzleTimer = 0.055;
+    this.muzzleFlash.visible = true;
+    this.aiming = true;
+    this.aimTimer = 0.7;
+
+    const cam = this.game.camera;
+    const dir = new THREE.Vector3();
+    cam.getWorldDirection(dir);
+    const origin = cam.position.clone();
+    this.game.effects?.muzzleFlash(origin.clone().add(dir.clone().multiplyScalar(1.2)), cam.quaternion);
+    this.game.audio?.gunshot();
+    this.game.effects?.shake(0.12);
+    this.game.police?.addHeat(this.game.config?.crime?.gunshot ?? 9, 'gunshot');
+    this.game.onGunshot?.(this.pos, dir);
     return true;
   }
 
   reload() {
-    const need = 12 - this.clip;
-    if (need <= 0 || this.ammo <= 0) return;
-    const take = Math.min(need, this.ammo);
-    this.clip += take;
-    this.ammo -= take;
+    if (this.reloading > 0 || this.reserve <= 0 || this.ammo >= PLAYER.mag) return;
+    this.reloading = 1.15;
+    this.game.audio?.click(340, 0.08);
   }
 
-  damage(amount, source) {
+  /** Get in a car: snap the camera behind it and take the wheel. */
+  enterCar(car) {
+    if (!car || this.inCar) return;
+    this.inCar = car;
+    car.driver = 'player';
+    car.ai = null;
+    car.parked = false;
+    car.setHeadlights(true);
+    if (car.headlight) car.headlight.intensity = 260;
+    this.root.visible = false;
+    this.game.setMode?.('car');
+    this.game.audio?.engineStart();
+    this.game.toast?.(`${(car.kind ?? 'car').toUpperCase()} TAKEN`);
+    if (car.ai === null && this.game.police) this.game.police.addHeat(4, 'carjack');
+  }
+
+  /** Step out: put the man on the pavement beside the driver's door. */
+  exitCar() {
+    const car = this.inCar;
+    if (!car) return;
+    const right = car.rightVec;
+    const side = new THREE.Vector2(-right.x, -right.y);
+    let x = car.pos.x + side.x * (car.wid * 0.5 + 0.7);
+    let z = car.pos.z + side.y * (car.wid * 0.5 + 0.7);
+    const fixed = this.game.world.resolveCircle(x, z, PLAYER.radius + 0.1);
+    x = fixed.x;
+    z = fixed.z;
+    this.inCar = null;
+    car.driver = null;
+    car.speed = 0;
+    car.vel.set(0, 0);
+    if (car.headlight) car.headlight.intensity = 0;
+    this.pos.set(x, this.game.world.groundY(x, z), z);
+    this.heading = car.heading;
+    this.cameraYaw = car.heading + Math.PI;
+    this.root.visible = true;
+    this.game.setMode?.('foot');
+    this.game.audio?.engineStop();
+  }
+
+  /** While driving, the player's position is the car's, and on-foot movement is frozen. */
+  updateInCar(dt, input) {
+    const car = this.inCar;
+    if (!car) return;
+    car.drive({
+      throttle: (input.forward ? 1 : 0) - (input.back ? 1 : 0),
+      steer: (input.right ? 1 : 0) - (input.left ? 1 : 0),
+      handbrake: !!input.handbrake,
+      boost: !!input.sprint,
+    }, dt);
+    this.pos.set(car.pos.x, 0, car.pos.z);
+    this.heading = car.heading;
+    this.speed = Math.abs(car.speed);
+    // the camera trails the car, still steerable with the mouse
+    this.updateCamera(dt);
+    this.game.audio?.engineNote(car.speedKph, input.forward, car.handbrake);
+    if (car.speedKph > 95 && this.game.police) {
+      this.game.police.addHeat(0.12 * dt, 'speeding');
+    }
+  }
+
+  /** Third-person camera: orbit around the target, damped, with a lift for the ground. */
+  updateCamera(dt, snap = false) {
+    const cam = this.game.camera;
+    const car = this.inCar;
+    const targetY = car ? 1.35 : 1.5;
+    const dist = this.cameraDist + (car ? Math.min(2.6, Math.abs(car.speed) * 0.055) : 0);
+    const yaw = this.cameraYaw;
+    const pitch = clamp(this.cameraPitch, -0.55, 0.95);
+    const target = new THREE.Vector3(this.pos.x, this.pos.y + targetY, this.pos.z);
+    const back = new THREE.Vector3(
+      Math.sin(yaw) * Math.cos(pitch),
+      Math.sin(pitch),
+      Math.cos(yaw) * Math.cos(pitch),
+    ).multiplyScalar(-dist);
+    const desired = target.clone().add(back);
+    // keep the lens out of the pavement and out of buildings
+    const gy = this.game.world.groundY(desired.x, desired.z) + 0.7;
+    if (desired.y < gy) desired.y = gy;
+    const pushed = this.game.world.resolveCircle(desired.x, desired.z, 0.55);
+    if (pushed.x !== desired.x || pushed.z !== desired.z) {
+      desired.x = pushed.x;
+      desired.z = pushed.z;
+      desired.y += 0.4;
+    }
+
+    if (snap) cam.position.copy(desired);
+    else {
+      const k = 1 - Math.exp(-CAMERA.damping * dt);
+      cam.position.lerp(desired, k);
+    }
+    // shake
+    if (this.shake > 0.001) {
+      const s = this.shake;
+      cam.position.x += (Math.sin(this.game.time * 61) * s) * 0.35;
+      cam.position.y += (Math.cos(this.game.time * 53) * s) * 0.3;
+      this.shake *= 0.9;
+    }
+    const lookAt = target.clone();
+    lookAt.x += Math.sin(yaw) * CAMERA.lookAhead * 0.35;
+    lookAt.z += Math.cos(yaw) * CAMERA.lookAhead * 0.35;
+    lookAt.y += car ? 0.55 : 0.25;
+    cam.lookAt(lookAt);
+    cam.fov = lerp(cam.fov, car ? CAMERA.fov + 5 : CAMERA.fov, 4 * dt);
+    cam.updateProjectionMatrix();
+  }
+
+  /** Take a hit: health down, screen shake, death if it runs out. */
+  hurt(amount) {
     if (!this.alive) return;
-    this.health = clamp(this.health - amount, 0, this.maxHealth);
-    this.lastHit = source || null;
+    this.health = clamp(this.health - amount, 0, PLAYER.health);
+    this.shake = Math.min(1, this.shake + amount / 60);
+    this.game.hud?.flashDamage();
     if (this.health <= 0) this.die();
   }
 
   die() {
     this.alive = false;
-    this.speed = 0;
-    this.respawnTimer = P.respawn;
-    if (this.inCar) this.exitCar(true);
+    this.deadTimer = 3.2;
+    this.root.rotation.z = 1.35;
+    this.game.audio?.thud();
+    this.game.hud?.toast('WASTED');
+    if (this.inCar) this.exitCar();
   }
 
   respawn() {
+    const p = this.game.world.nearestPavement(this.pos.x, this.pos.z);
     this.alive = true;
-    this.health = this.maxHealth;
-    this.respawnTimer = 0;
-    this.ammo = 42;
-    this.clip = 12;
-    const spot = this.world.randomSidewalkPoint(this.rng);
-    this.place(spot.x, spot.z, 0);
+    this.health = PLAYER.health;
+    this.ammo = PLAYER.mag;
+    this.reserve = PLAYER.maxAmmo;
+    this.root.rotation.z = 0;
+    this.setPosition(p.x, p.z, this.heading);
+    this.game.police?.reset();
   }
 
-  enterCar(car) {
-    this.inCar = car;
-    this.root.visible = false;
-    this.speed = 0;
-  }
-
-  exitCar(force = false) {
-    const car = this.inCar;
-    if (!car) return;
-    this.inCar = null;
-    // Step out on the kerb side.
-    const side = car.rightX * 2.1;
-    const sideZ = car.rightZ * 2.1;
-    const spot = this.world.nearestSidewalkPoint(car.x + side, car.z + sideZ);
-    this.place(spot.x, spot.z, car.yaw);
-    this.root.visible = true;
-    if (!force) car.speed = 0;
-  }
-}
-
-// ------------------------------------------------------------------ camera
-
-export class GameCamera {
-  constructor(camera) {
-    this.camera = camera;
-    this.yaw = 0;
-    this.pitch = -0.06;
-    this.distance = CAMERA.foot.distance;
-    this.height = CAMERA.foot.height;
-    this.shoulder = CAMERA.foot.shoulder;
-    this.pos = new THREE.Vector3();
-    this.lookAt = new THREE.Vector3();
-    this.target = new THREE.Vector3();
-    this.shake = 0;
-    this.bobPhase = 0;
-    this.mode = 'foot';
-    this.initialised = false;
-  }
-
-  configure(mode) {
-    this.mode = mode;
-    const cfg = mode === 'car' ? CAMERA.car : CAMERA.foot;
-    this.desiredDistance = cfg.distance;
-    this.desiredHeight = cfg.height;
-    this.desiredShoulder = cfg.shoulder;
-    this.lookHeight = cfg.lookHeight;
-  }
-
-  addShake(amount) {
-    this.shake = Math.min(1.6, this.shake + amount);
-  }
-
-  snap(target, yaw) {
-    this.yaw = yaw;
-    this.update(0.016, target, true);
-  }
-
-  update(dt, target, instant = false) {
-    this.distance = instant ? this.desiredDistance : damp(this.distance, this.desiredDistance, 5, dt);
-    this.height = instant ? this.desiredHeight : damp(this.height, this.desiredHeight, 5, dt);
-    this.shoulder = instant ? this.desiredShoulder : damp(this.shoulder, this.desiredShoulder, 5, dt);
-
-    this.bobPhase += dt * 9;
-    const bob = this.mode === 'foot' ? Math.sin(this.bobPhase) * CAMERA.bob * (target.speed / 4) : 0;
-
-    const yaw = this.yaw;
-    const fx = Math.cos(yaw);
-    const fz = -Math.sin(yaw);
-    const rx = Math.sin(yaw);
-    const rz = Math.cos(yaw);
-
-    const anchorY = target.y + this.lookHeight;
-    this.target.set(target.x, anchorY, target.z);
-
-    const px = target.x - fx * this.distance + rx * this.shoulder;
-    const pz = target.z - fz * this.distance + rz * this.shoulder;
-    const py = target.y + this.height + bob;
-
-    if (instant || !this.initialised) {
-      this.pos.set(px, py, pz);
-      this.initialised = true;
-    } else {
-      const k = 1 - Math.exp(-CAMERA.follow * dt);
-      this.pos.x += (px - this.pos.x) * k;
-      this.pos.y += (py - this.pos.y) * k;
-      this.pos.z += (pz - this.pos.z) * k;
+  /** Per-frame tick for the parts that keep running whether or not there is input. */
+  tick(dt) {
+    if (!this.alive) {
+      this.deadTimer -= dt;
+      if (this.deadTimer <= 0) this.respawn();
+      return;
     }
-
-    this.camera.position.copy(this.pos);
-
-    // Shake decays fast and is applied in camera space.
-    this.shake = Math.max(0, this.shake - dt * 2.2);
-    if (this.shake > 0.001) {
-      const s = this.shake * 0.35;
-      this.camera.position.x += Math.sin(this.bobPhase * 7.3) * s;
-      this.camera.position.y += Math.cos(this.bobPhase * 5.1) * s;
-      this.camera.position.z += Math.sin(this.bobPhase * 3.7) * s * 0.5;
-    }
-
-    this.lookAt.set(
-      target.x + fx * 3.2,
-      anchorY + Math.sin(this.pitch) * 4.4 + 0.15 + (this.mode === 'car' ? 1.35 : 0),
-      target.z + fz * 3.2,
-    );
-    this.camera.lookAt(this.lookAt);
-
-    if (this.shake > 0.001) {
-      this.camera.rotation.z += Math.sin(this.bobPhase * 9.1) * this.shake * 0.012;
+    if (this.aimTimer > 0) {
+      this.aimTimer -= dt;
+      if (this.aimTimer <= 0) this.aiming = false;
     }
   }
-}
-
-export function createPlayer(scene, world, rng) {
-  return new Player(scene, world, rng);
 }
